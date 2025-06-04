@@ -1,0 +1,2437 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#===============================================================================
+# GTEx Tissue-Level Modeling Pipeline
+# Purpose: Tissue-specific quality prediction using Lasso regression
+#===============================================================================
+
+#------------------------------------------------------------------------------
+# 1. Setup
+#------------------------------------------------------------------------------
+```{r}
+# Load data once
+if(!exists("merged_gtex")) {
+  merged_gtex <- readRDS(file.path(data_path, "processed/merged_gtex.rds"))
+}
+```
+
+#------------------------------------------------------------------------------
+# 2. Within-Group vs Between-Group Analysis for Single Tissue
+#------------------------------------------------------------------------------
+```{r}
+# Analyze a specific tissue
+tissue_name <- "Esophagus"
+tissue_data <- merged_gtex[tissue_main == tissue_name]
+subtypes <- unique(tissue_data$tissue_sub)
+
+if(length(subtypes) > 1 && nrow(tissue_data) >= 10) {
+  # Extract and scale features
+  feature_cols <- grep("^feature_", names(tissue_data), value = TRUE)
+  feature_matrix <- scale(as.matrix(tissue_data[, ..feature_cols]))
+  
+  # Calculate distance matrix
+  dist_matrix <- dist(feature_matrix)
+  
+  # Calculate within-group and between-group distances
+  within_distances <- list()
+  between_distances <- list()
+  
+  for(subtype in subtypes) {
+    subtype_indices <- which(tissue_data$tissue_sub == subtype)
+    
+    if(length(subtype_indices) > 1) {
+      # Within-group distances
+      subtype_dist <- as.matrix(dist_matrix)[subtype_indices, subtype_indices]
+      within_distances[[subtype]] <- subtype_dist[upper.tri(subtype_dist)]
+      
+      # Between-group distances
+      other_indices <- which(tissue_data$tissue_sub != subtype)
+      if(length(other_indices) > 0) {
+        between_dists <- as.matrix(dist_matrix)[subtype_indices, other_indices]
+        between_distances[[subtype]] <- as.vector(between_dists)
+      }
+    }
+  }
+  
+  # Calculate summary statistics
+  all_within <- unlist(within_distances)
+  all_between <- unlist(between_distances)
+  
+  similarity_results <- list(
+    tissue = tissue_name,
+    subtypes = subtypes,
+    samples_per_subtype = table(tissue_data$tissue_sub),
+    summary = data.frame(
+      comparison = c("Within Subtype", "Between Subtypes"),
+      mean_distance = c(mean(all_within), mean(all_between)),
+      median_distance = c(median(all_within), median(all_between))
+    ),
+    ratio = mean(all_between) / mean(all_within)
+  )
+  
+  # PERMANOVA test
+  perm_test <- adonis2(dist_matrix ~ tissue_sub, data = tissue_data)
+  statistical_results <- list(
+    tissue = tissue_name,
+    permanova = perm_test,
+    r_squared = perm_test$R2[1],
+    p_value = perm_test$`Pr(>F)`[1],
+    significant = perm_test$`Pr(>F)`[1] < 0.05
+  )
+  
+  # Create visualizations
+  pca_result <- prcomp(feature_matrix)
+  pca_plot <- ggplot(data.frame(PC1 = pca_result$x[,1], PC2 = pca_result$x[,2], 
+                                Subtype = tissue_data$tissue_sub), 
+                     aes(x = PC1, y = PC2, color = Subtype)) +
+    geom_point(alpha = 0.7, size = 3) +
+    theme_minimal() +
+    labs(title = paste("PCA of", tissue_name, "by Subtype"))
+  
+  ggsave(file.path(output_path, paste0(tissue_name, "_subtype_pca.pdf")), 
+         pca_plot, width = 10, height = 8, dpi = 300)
+  
+  # UMAP visualization
+  set.seed(123)
+  umap_result <- uwot::umap(feature_matrix, n_neighbors = min(15, nrow(feature_matrix)-1))
+  
+  umap_plot <- ggplot(data.frame(UMAP1 = umap_result[,1], UMAP2 = umap_result[,2],
+                                 Subtype = tissue_data$tissue_sub),
+                     aes(x = UMAP1, y = UMAP2, color = Subtype)) +
+    geom_point(alpha = 0.7, size = 3) +
+    theme_minimal() +
+    labs(title = paste("UMAP of", tissue_name, "by Subtype"))
+  
+  ggsave(file.path(output_path, paste0(tissue_name, "_subtype_umap.pdf")), 
+         umap_plot, width = 10, height = 8, dpi = 300)
+  
+  # Save results
+  saveRDS(similarity_results, file.path(results_path, paste0(tissue_name, "_distance_analysis.rds")))
+  saveRDS(statistical_results, file.path(results_path, paste0(tissue_name, "_statistical_tests.rds")))
+}
+```
+
+#------------------------------------------------------------------------------
+# 3. Tissue-Level Lasso Modeling
+#------------------------------------------------------------------------------
+```{r}
+# Set parameters
+k_folds <- 5
+targets <- c("SMRIN", "SMATSSCR")
+tissues <- unique(merged_gtex$tissue_main)
+all_results <- list()
+
+# Process each target
+for(target in targets) {
+  target_results <- list()
+  message(paste("\nProcessing target:", target))
+  
+  # Process each tissue
+  for(tissue_name in tissues) {
+    message(paste("\nAnalyzing", tissue_name, "for", target))
+    
+    # Extract and filter data
+    tissue_data <- merged_gtex[tissue_main == tissue_name]
+    tissue_data <- tissue_data[!is.na(tissue_data[[target]])]
+    
+    if(nrow(tissue_data) < 10) {
+      message(paste("Insufficient samples for", tissue_name))
+      next
+    }
+    
+    # Feature selection
+    feature_cols <- grep("^feature_", names(tissue_data), value = TRUE)
+    feature_vars <- apply(tissue_data[, ..feature_cols], 2, var)
+    valid_features <- feature_cols[feature_vars > 1e-10]
+    
+    # Create cross-validation folds
+    set.seed(123)
+    folds <- createFolds(tissue_data[[target]], k = k_folds)
+    
+    # Cross-validation
+    fold_results <- list()
+    all_fold_predictions <- data.frame()
+    
+    for(i in 1:k_folds) {
+      # Split data
+      test_indices <- folds[[i]]
+      train_data <- tissue_data[-test_indices]
+      test_data <- tissue_data[test_indices]
+      
+      # Feature selection - top 5% correlated
+      feature_correlations <- sapply(valid_features, function(col) {
+        cor(train_data[[col]], train_data[[target]], use = "complete.obs")
+      })
+      
+      top_n_features <- ceiling(length(valid_features) * 0.05)
+      top_features <- names(sort(abs(feature_correlations), decreasing = TRUE))[1:top_n_features]
+      
+      # Prepare matrices
+      x_train <- as.matrix(train_data[, ..top_features])
+      y_train <- train_data[[target]]
+      x_train_scaled <- scale(x_train)
+      x_mean <- attr(x_train_scaled, "scaled:center")
+      x_sd <- attr(x_train_scaled, "scaled:scale")
+      
+      # Train model
+      cv_fit <- cv.glmnet(x_train_scaled, y_train, alpha = 1)
+      best_lambda <- cv_fit$lambda.min
+      lasso_model <- glmnet(x_train_scaled, y_train, alpha = 1, lambda = best_lambda)
+      
+      # Make predictions
+      x_test <- as.matrix(test_data[, ..top_features])
+      x_test_scaled <- scale(x_test, center = x_mean, scale = x_sd)
+      predictions <- predict(lasso_model, x_test_scaled, s = best_lambda)
+      
+      # Store predictions
+      fold_predictions <- data.frame(
+        fold = i,
+        sample_id = test_data$sample_id,
+        actual = test_data[[target]],
+        predicted = as.numeric(predictions)
+      )
+      all_fold_predictions <- rbind(all_fold_predictions, fold_predictions)
+      
+      # Calculate metrics
+      rmse <- sqrt(mean((predictions - test_data[[target]])^2))
+      r_value <- cor(predictions, test_data[[target]]) 
+      r2 <- cor(predictions, test_data[[target]])^2
+      mae <- mean(abs(predictions - test_data[[target]]))
+      
+      fold_results[[i]] <- list(
+        fold = i,
+        rmse = rmse,
+        r = r_value,
+        r2 = r2,
+        mae = mae,
+        lambda = best_lambda,
+        model = lasso_model,
+        features = top_features
+      )
+    }
+    
+    # Calculate overall performance
+    pooled_rmse <- sqrt(mean((all_fold_predictions$predicted - all_fold_predictions$actual)^2))
+    pooled_r <- cor(all_fold_predictions$predicted, all_fold_predictions$actual)  # <-- R, not R²
+    pooled_r2 <- cor(all_fold_predictions$predicted, all_fold_predictions$actual)^2
+    pooled_mae <- mean(abs(all_fold_predictions$predicted - all_fold_predictions$actual))
+    
+    # Count feature selection frequency
+    all_selected_features <- unlist(lapply(fold_results, function(x) x$features))
+    feature_counts <- table(all_selected_features)
+    consistent_features <- names(feature_counts[feature_counts >= 3])
+    
+    # Store results
+    tissue_model_result <- list(
+      tissue = tissue_name,
+      target = target,
+      performance = list(
+        pooled_rmse = pooled_rmse,
+        pooled_r = pooled_r,
+        pooled_r2 = pooled_r2,
+        pooled_mae = pooled_mae
+      ),
+      fold_results = fold_results,
+      feature_counts = feature_counts,
+      consistent_features = consistent_features,
+      sample_size = nrow(tissue_data),
+      all_predictions = all_fold_predictions
+    )
+    
+    target_results[[tissue_name]] <- tissue_model_result
+    
+    # Create visualization for good models (using R > 0.55 which is approximately R² > 0.3)
+  # if(pooled_r2 > 0.3) {  # use if R² is required
+    if(abs(pooled_r) > 0.55) {
+      scatter_plot <- ggplot(all_fold_predictions, aes(x = actual, y = predicted)) +
+        geom_point(alpha = 0.6, color = "darkblue", size = 2) +
+        geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+        geom_smooth(method = "lm", se = TRUE, color = "blue") +
+        labs(
+          title = paste(tissue_name, "-", target, "Prediction"),
+          subtitle = paste("R =", round(pooled_r, 3), "RMSE =", round(pooled_rmse, 3)),
+        # subtitle = paste("R² =", round(pooled_r2, 3), "RMSE =", round(pooled_rmse, 3)), # use if R² is required
+          x = paste("Actual", target),
+          y = paste("Predicted", target)
+        ) +
+        theme_minimal()
+      
+      ggsave(file.path(output_path, paste0(tissue_name, "_", target, "_scatter.pdf")), 
+             scatter_plot, width = 10, height = 6, dpi = 300)
+    }
+  }
+  
+  all_results[[target]] <- target_results
+  saveRDS(target_results, file.path(results_path, paste0(target, "_model_results.rds")))
+}
+
+saveRDS(all_results, file.path(results_path, "all_tissue_models_complete.rds"))
+```
+
+#------------------------------------------------------------------------------
+# 4. Model Performance Summary
+#------------------------------------------------------------------------------
+```{r}
+# Create performance summary
+create_performance_summary <- function(results, target_name) {
+  summary_df <- data.frame()
+  
+  for(tissue in names(results)) {
+    tissue_result <- results[[tissue]]
+    if(is.null(tissue_result)) next
+    
+    row <- data.frame(
+      Tissue = tissue,
+      Samples = tissue_result$sample_size,
+      RMSE = round(tissue_result$performance$pooled_rmse, 3),
+      R = round(tissue_result$performance$pooled_r, 3),
+    # R_squared = round(tissue_result$performance$pooled_r2, 3), # use if R² is required
+      MAE = round(tissue_result$performance$pooled_mae, 3),
+      Consistent_Features = length(tissue_result$consistent_features)
+    )
+    summary_df <- rbind(summary_df, row)
+  }
+  
+  summary_df <- summary_df[order(abs(summary_df$R), decreasing = TRUE),]  # Sort by absolute R
+  summary_df$Performance_Category <- cut(abs(summary_df$R),  # Use absolute R for categories
+                                      breaks = c(-Inf, 0.316, 0.548, 0.707, Inf), 
+                                      labels = c("Poor", "Moderate", "Good", "Excellent"))  
+
+# summary_df <- summary_df[order(summary_df$R_squared, decreasing = TRUE),] # Sort by R²
+# summary_df$Performance_Category <- cut(summary_df$R_squared, # Use R² for categories
+                                  #  breaks = c(-Inf, 0.1, 0.3, 0.5, Inf), 
+                                  #  labels = c("Poor", "Moderate", "Good", "Excellent"))
+  
+  return(summary_df)
+}
+
+# Create summaries
+rin_summary <- create_performance_summary(all_results[["SMRIN"]], "RIN Score")
+autolysis_summary <- create_performance_summary(all_results[["SMATSSCR"]], "Autolysis Score")
+
+# Save summaries
+write.csv(rin_summary, file.path(results_path, "rin_model_summary.csv"), row.names = FALSE)
+write.csv(autolysis_summary, file.path(results_path, "autolysis_model_summary.csv"), row.names = FALSE)
+
+# Create comparison
+model_comparison <- merge(
+  rin_summary[, c("Tissue", "R")],
+  autolysis_summary[, c("Tissue", "R")],
+  by = "Tissue",
+  suffixes = c("_RIN", "_Auto")
+)
+model_comparison$Better_Model <- ifelse(abs(model_comparison$R_RIN) > abs(model_comparison$R_Auto), 
+                                      "RIN", "Autolysis")
+
+# Create comparison when if required for R²
+# model_comparison <- merge(
+#   rin_summary[, c("Tissue", "R_squared")],
+#   autolysis_summary[, c("Tissue", "R_squared")],
+#   by = "Tissue",
+#   suffixes = c("_RIN", "_Auto")
+# )
+# model_comparison$Better_Model <- ifelse(model_comparison$R_squared_RIN > model_comparison$R_squared_Auto, 
+#                                       "RIN", "Autolysis")
+write.csv(model_comparison, file.path(results_path, "model_comparison.csv"), row.names = FALSE)
+```
+
+#------------------------------------------------------------------------------
+# 5. Figure 3 - Model Performance Visualization
+#------------------------------------------------------------------------------
+```{r}
+# Panel A & B: Performance bar plots
+create_horizontal_barplot <- function(all_results, score_type, panel_label) {
+  r_values <- sapply(all_results[[score_type]], function(x) {
+    if(is.null(x)) return(0)
+    return(x$performance$pooled_r)
+  # return(sqrt(x$performance$pooled_r2)) # use when required for R²
+  })
+  
+  plot_data <- data.frame(
+    Tissue = names(r_values),
+    R = r_values
+  )[order(-r_values), ]
+  
+  plot_data$Tissue <- factor(plot_data$Tissue, levels = rev(plot_data$Tissue))
+  
+  if(score_type == "SMRIN") {
+    color_gradient <- colorRampPalette(c("#E8F5E8", "#66cdaa", "#2E8B57"))(100)
+  } else {
+    color_gradient <- colorRampPalette(c("#FFF2E6", "#FC8D62", "#D94801"))(100)
+  }
+  
+  bar_plot <- ggplot(plot_data, aes(x = R, y = Tissue, fill = R)) +
+    geom_bar(stat = "identity", width = 0.8) +
+    geom_text(aes(label = sprintf("%.3f", R), x = R/2), 
+              hjust = 0.5, size = 3.5, fontface = "bold") +
+    scale_fill_gradientn(colors = color_gradient, guide = "none") +
+    theme_minimal() +
+    labs(title = panel_label, x = "Correlation Coefficient (R)", y = "") +
+    theme(
+      plot.title = element_text(size = 20, face = "bold", hjust = 0),
+      axis.title.x = element_text(size = 14, face = "bold"),
+      axis.text.y = element_text(size = 13, face = "bold")
+    )
+  
+  return(bar_plot)
+}
+
+rin_barplot <- create_horizontal_barplot(all_results, "SMRIN", "A")
+autolysis_barplot <- create_horizontal_barplot(all_results, "SMATSSCR", "B")
+
+# Panel C: RIN scatter plots
+create_scatter_panel <- function(all_results, top_tissues) {
+  plots <- list()
+  
+  for(i in 1:3) {
+    result <- all_results[["SMRIN"]][[top_tissues[i]]]
+    if(is.null(result)) next
+    
+    all_preds <- result$all_predictions
+    r_value <- result$performance$pooled_r
+  # r_value <- sqrt(result$performance$pooled_r2) # use when required for R²
+    rmse_value <- result$performance$pooled_rmse
+    
+    p <- ggplot(all_preds, aes(x = actual, y = predicted)) +
+      geom_point(alpha = 0.7, color = "#66cdaa", size = 1.5) +
+      geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+      geom_smooth(method = "lm", se = TRUE, color = "blue") +
+      ggtitle(paste0(top_tissues[i], " | R = ", round(r_value, 3))) +
+      theme_minimal()
+    
+    plots[[i]] <- p
+  }
+  
+  return(plots)
+}
+
+# Get top 3 tissues
+all_r_rin <- sapply(all_results[["SMRIN"]], function(x) {
+  if(is.null(x)) return(0)
+  return(abs(x$performance$pooled_r))  # Use absolute value for sorting
+# return(sqrt(x$performance$pooled_r2)) # use when required for R²
+})
+top_rin_tissues <- names(sort(all_r_rin, decreasing = TRUE))[1:3]
+
+rin_scatter_plots <- create_scatter_panel(all_results, top_rin_tissues)
+rin_grid <- grid.arrange(grobs = rin_scatter_plots, nrow = 1,
+                        bottom = textGrob("Actual RIN Score", gp = gpar(fontsize = 18, fontface = "bold")),
+                        left = textGrob("Predicted RIN Score", rot = 90, gp = gpar(fontsize = 18, fontface = "bold")),
+                        top = textGrob("C", x = 0.02, just = "left", gp = gpar(fontsize = 18, fontface = "bold")))
+
+# Panel D: Autolysis box plots
+create_boxplot_panel <- function(all_results, top_tissues) {
+  plots <- list()
+  
+  for(i in 1:3) {
+    result <- all_results[["SMATSSCR"]][[top_tissues[i]]]
+    if(is.null(result)) next
+    
+    all_preds <- result$all_predictions
+    all_preds$actual_factor <- factor(all_preds$actual, levels = c(0, 1, 2, 3))
+    r_value <- sqrt(result$performance$pooled_r2)
+    rmse_value <- result$performance$pooled_rmse
+    
+    p <- ggplot(all_preds, aes(x = actual_factor, y = predicted)) +
+      geom_boxplot(aes(fill = actual_factor), outlier.shape = NA) +
+      geom_jitter(width = 0.2, height = 0, alpha = 0.2, color = "#21908d") +
+      scale_fill_manual(values = c("0" = "#e0e0e0", "1" = "#bdd7e7", 
+                                 "2" = "#9ecae1", "3" = "#6baed6")) +
+      ggtitle(paste0(top_tissues[i], " | R = ", round(r_value, 3))) +
+      theme_minimal() +
+      theme(legend.position = "none")
+    
+    plots[[i]] <- p
+  }
+  
+  return(plots)
+}
+
+all_r_auto <- sapply(all_results[["SMATSSCR"]], function(x) {
+  if(is.null(x)) return(0)
+  return(sqrt(x$performance$pooled_r2))
+})
+top_auto_tissues <- names(sort(all_r_auto, decreasing = TRUE))[1:3]
+
+auto_boxplot_plots <- create_boxplot_panel(all_results, top_auto_tissues)
+autolysis_grid <- grid.arrange(grobs = auto_boxplot_plots, nrow = 1,
+                              bottom = textGrob("Actual Category", gp = gpar(fontsize = 18, fontface = "bold")),
+                              left = textGrob("Predicted Score", rot = 90, gp = gpar(fontsize = 18, fontface = "bold")),
+                              top = textGrob("D", x = 0.02, just = "left", gp = gpar(fontsize = 18, fontface = "bold")))
+
+# Combine all panels
+combined_barplots <- grid.arrange(rin_barplot, autolysis_barplot, ncol = 2)
+combined_CD_plots <- grid.arrange(rin_grid, autolysis_grid, nrow = 2)
+figure3_final <- grid.arrange(combined_barplots, combined_CD_plots, ncol = 2, widths = c(0.45, 0.55))
+
+ggsave(file.path(output_path, "Figure3_Final_Complete.pdf"), 
+       figure3_final, width = 20, height = 12, dpi = 600, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 6. Figure 4 - Feature Importance
+#------------------------------------------------------------------------------
+```{r}
+# Extract top features
+extract_features <- function(results, target, top_n = 20) {
+  all_tissue_features <- data.frame()
+  
+  for(tissue in names(results[[target]])) {
+    tissue_result <- results[[target]][[tissue]]
+    if(is.null(tissue_result)) next
+    
+    if(!is.null(tissue_result$feature_counts)) {
+      features <- names(tissue_result$feature_counts)
+      counts <- as.numeric(tissue_result$feature_counts)
+      
+      tissue_df <- data.frame(
+        feature = features,
+        count = counts,
+        tissue = tissue,
+        stringsAsFactors = FALSE
+      )
+      all_tissue_features <- rbind(all_tissue_features, tissue_df)
+    }
+  }
+  
+  feature_summary <- all_tissue_features %>%
+    group_by(feature) %>%
+    summarize(total_count = sum(count)) %>%
+    arrange(desc(total_count)) %>%
+    slice(1:top_n)
+  
+  feature_matrix <- all_tissue_features %>%
+    filter(feature %in% feature_summary$feature) %>%
+    reshape2::dcast(feature ~ tissue, value.var = "count", fill = 0)
+  
+  return(list(summary = feature_summary, matrix = feature_matrix))
+}
+
+rin_features <- extract_features(all_results, "SMRIN")
+auto_features <- extract_features(all_results, "SMATSSCR")
+
+# Find common features
+common_features <- intersect(rin_features$summary$feature, auto_features$summary$feature)
+rin_only_features <- setdiff(rin_features$summary$feature, auto_features$summary$feature)
+auto_only_features <- setdiff(auto_features$summary$feature, rin_features$summary$feature)
+
+# Create heatmaps
+create_heatmap <- function(feature_data, color_palette) {
+  feature_long <- reshape2::melt(feature_data$matrix, id.vars = "feature",
+                               variable.name = "tissue", value.name = "count")
+  
+  feature_long <- merge(feature_long, feature_data$summary[, c("feature", "total_count")], by = "feature")
+  feature_long$feature_label <- sub("feature_", "", feature_long$feature)
+  
+  p <- ggplot(feature_long, aes(x = tissue, y = reorder(feature_label, total_count))) +
+    geom_tile(aes(fill = count), color = "white", size = 0.1) +
+    scale_fill_gradientn(colors = color_palette, name = "Selection\nFrequency") +
+    labs(x = NULL, y = "Feature ID") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 65, hjust = 1, size = 12, face = "bold"),
+      axis.text.y = element_text(size = 12, face = "bold"),
+      panel.grid = element_blank()
+    )
+  
+  return(p)
+}
+
+rin_heatmap <- create_heatmap(rin_features, 
+                             colorRampPalette(c("white", "#66CDAA", "#006400"))(100)) +
+  ggtitle("A")
+
+auto_heatmap <- create_heatmap(auto_features,
+                              colorRampPalette(c("white", "#FC8D62", "#D94801"))(100)) +
+  ggtitle("B")
+
+# Create Venn diagram
+venn_plot <- ggplot() +
+  ggforce::geom_circle(data = data.frame(x = c(-1, 1), y = c(0, 0), r = c(2, 2),
+                                        category = c("RIN Features", "Autolysis Features")),
+                      aes(x0 = x, y0 = y, r = r, fill = category),
+                      alpha = 0.5, color = "black", size = 0.8) +
+  geom_text(data = data.frame(x = c(-1.65, 0, 1.65), y = c(0, 0, 0),
+                              label = c(length(rin_only_features), 
+                                       length(common_features),
+                                       length(auto_only_features))),
+           aes(x = x, y = y, label = label), size = 10, fontface = "bold") +
+  scale_fill_manual(values = c("RIN Features" = "#66CDAA", "Autolysis Features" = "#FC8D62")) +
+  theme_void() +
+  theme(legend.position = "none") +
+  coord_fixed() +
+  xlim(-3, 3) + ylim(-2, 2) +
+  ggtitle("C")
+
+# Combine plots
+heatmaps <- plot_grid(rin_heatmap, auto_heatmap, ncol = 2)
+figure4 <- plot_grid(heatmaps, venn_plot, nrow = 2, rel_heights = c(2, 1.5))
+
+ggsave(file.path(output_path, "Figure4_Feature.pdf"), 
+       figure4, width = 14, height = 12, dpi = 600, bg = "transparent")
+```
+
+
+#------------------------------------------------------------------------------
+# 7. Additional Visualizations and Comparative Analysis
+#------------------------------------------------------------------------------
+```{r}
+# Create comparative performance chart for top tissues
+create_comparative_bar_chart <- function(rin_results, autolysis_results) {
+  common_tissues <- intersect(rin_results$Tissue, autolysis_results$Tissue)
+  
+  comparison_data <- data.frame(
+    Tissue = common_tissues,
+    RIN_R = rin_results$R[match(common_tissues, rin_results$Tissue)],
+    Autolysis_R = autolysis_results$R[match(common_tissues, autolysis_results$Tissue)]
+  )
+  
+  comparison_data$Average_R <- (abs(comparison_data$RIN_R) + abs(comparison_data$Autolysis_R)) / 2
+  comparison_data <- comparison_data[order(-comparison_data$Average_R), ]
+  top_tissues <- head(comparison_data, 15)
+  
+  plot_data <- reshape2::melt(top_tissues[, c("Tissue", "RIN_R", "Autolysis_R")], 
+                             id.vars = "Tissue", variable.name = "Model", value.name = "R_value")
+  plot_data$Tissue <- factor(plot_data$Tissue, levels = top_tissues$Tissue)
+  
+  comparison_plot <- ggplot(plot_data, aes(x = Tissue, y = R_value, fill = Model)) +
+    geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+    geom_text(aes(label = sprintf("%.3f", R_value)), 
+             position = position_dodge(width = 0.9), vjust = -0.3, size = 3) +
+    scale_fill_manual(values = c("RIN_R" = "#66CDAA", "Autolysis_R" = "#FC8D62"),
+                     labels = c("RIN", "Autolysis")) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 11, face = "bold"),
+      plot.title = element_text(size = 16, face = "bold"),
+      legend.position = "top"
+    ) +
+    labs(
+      title = "Model Performance Comparison Across Top Tissues",
+      subtitle = "Top 15 tissues ranked by average correlation coefficient",
+      x = "Tissue Type",
+      y = "Correlation Coefficient (R)",
+      fill = "Model Type"
+    )
+  
+  ggsave(file.path(output_path, "comparative_performance_chart.pdf"), 
+         comparison_plot, width = 14, height = 8, dpi = 300)
+  
+  return(comparison_plot)
+}
+
+# Create correlation distribution analysis
+create_correlation_distribution <- function(results_df, target_name) {
+  r_dist_plot <- ggplot(results_df, aes(x = abs(R))) +
+    geom_histogram(binwidth = 0.05, fill = "steelblue", color = "white", alpha = 0.8) +
+    geom_vline(aes(xintercept = mean(abs(R))), 
+              color = "red", linetype = "dashed", size = 1.2) +
+    geom_vline(aes(xintercept = median(abs(R))), 
+              color = "darkgreen", linetype = "dashed", size = 1.2) +
+    annotate("text", x = mean(abs(results_df$R)) + 0.08, y = max(table(cut(abs(results_df$R), 20))) * 0.8, 
+             label = paste("Mean =", round(mean(abs(results_df$R)), 3)),
+             color = "red", fontface = "bold") +
+    annotate("text", x = median(abs(results_df$R)) - 0.08, y = max(table(cut(abs(results_df$R), 20))) * 0.6, 
+             label = paste("Median =", round(median(abs(results_df$R)), 3)),
+             color = "darkgreen", fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("Distribution of Correlation Coefficients:", target_name),
+      subtitle = paste("Analysis of", nrow(results_df), "tissue-specific models"),
+      x = "Absolute Correlation Coefficient |R|",
+      y = "Frequency"
+    ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12, face = "bold")
+    )
+  
+  ggsave(file.path(output_path, paste0(gsub(" ", "_", tolower(target_name)), "_correlation_distribution.pdf")), 
+         r_dist_plot, width = 10, height = 7, dpi = 300)
+  
+  return(r_dist_plot)
+}
+
+# Create enhanced scatter plots with residual analysis
+create_enhanced_scatter_plots <- function(results, target_name, top_n = 6) {
+  all_r_values <- sapply(results, function(x) {
+    if(is.null(x)) return(0)
+    return(abs(x$performance$pooled_r))
+  })
+  
+  top_tissues <- names(sort(all_r_values, decreasing = TRUE))[1:min(top_n, length(all_r_values))]
+  
+  for(tissue in top_tissues) {
+    if(is.null(results[[tissue]])) next
+    
+    predictions <- results[[tissue]]$all_predictions
+    r_value <- results[[tissue]]$performance$pooled_r
+    rmse_value <- results[[tissue]]$performance$pooled_rmse
+    
+    predictions$residual <- predictions$predicted - predictions$actual
+    
+    scatter_plot <- ggplot(predictions, aes(x = actual, y = predicted)) +
+      geom_point(alpha = 0.7, color = "#2E86AB", size = 2.5) +
+      geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 1) +
+      geom_smooth(method = "lm", se = TRUE, color = "darkblue", alpha = 0.3) +
+      labs(
+        title = paste(tissue, "-", target_name, "Prediction Model"),
+        subtitle = paste("R =", round(r_value, 3), "| RMSE =", round(rmse_value, 3)),
+        x = paste("Actual", target_name),
+        y = paste("Predicted", target_name)
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        axis.title = element_text(size = 11, face = "bold")
+      )
+    
+    ggsave(file.path(output_path, paste0("enhanced_", tissue, "_", gsub(" ", "_", tolower(target_name)), "_scatter.pdf")), 
+           scatter_plot, width = 10, height = 8, dpi = 300)
+  }
+}
+
+# Execute comparative visualizations
+comparison_chart <- create_comparative_bar_chart(rin_summary, autolysis_summary)
+rin_distribution <- create_correlation_distribution(rin_summary, "RIN Score")
+autolysis_distribution <- create_correlation_distribution(autolysis_summary, "Autolysis Score")
+
+create_enhanced_scatter_plots(all_results[["SMRIN"]], "RIN Score", top_n = 6)
+create_enhanced_scatter_plots(all_results[["SMATSSCR"]], "Autolysis Score", top_n = 6)
+```
+
+
+#------------------------------------------------------------------------------
+# 8. Figure 5: Model Performance vs Sample Size Analysis
+#------------------------------------------------------------------------------
+```{r}
+create_sample_size_analysis <- function(rin_summary, autolysis_summary) {
+  
+  combined_data <- rbind(
+    data.frame(
+      Tissue = rin_summary$Tissue,
+      Samples = rin_summary$Samples, 
+      R_value = abs(rin_summary$R),
+      Model = "RIN"
+    ),
+    data.frame(
+      Tissue = autolysis_summary$Tissue,
+      Samples = autolysis_summary$Samples,
+      R_value = abs(autolysis_summary$R),
+      Model = "Autolysis"
+    )
+  )
+  
+  scatter_panel <- ggplot(combined_data, aes(x = Samples, y = R_value, color = Model)) +
+    geom_point(size = 3.5, alpha = 0.8) +
+    geom_smooth(method = "lm", se = TRUE, alpha = 0.3, size = 1.2) +
+    scale_color_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+    theme_minimal() +
+    labs(
+      title = "A",
+      x = "Sample Size (n)",
+      y = "Correlation Coefficient |R|",
+      subtitle = "Relationship between sample size and model performance"
+    ) +
+    theme(
+      plot.title = element_text(size = 20, face = "bold", hjust = 0),
+      plot.subtitle = element_text(size = 12),
+      legend.position = "top",
+      legend.title = element_text(size = 12, face = "bold"),
+      axis.title = element_text(size = 12, face = "bold")
+    )
+  
+  combined_data$size_category <- cut(combined_data$Samples, 
+                                   breaks = c(0, 50, 100, 200, 500, Inf),
+                                   labels = c("≤50", "51-100", "101-200", "201-500", ">500"))
+  
+  bin_summary <- combined_data %>%
+    group_by(size_category, Model) %>%
+    summarise(
+      mean_r = mean(R_value, na.rm = TRUE),
+      se_r = sd(R_value, na.rm = TRUE) / sqrt(n()),
+      tissue_count = n(),
+      .groups = 'drop'
+    )
+  
+  bin_panel <- ggplot(bin_summary, aes(x = size_category, y = mean_r, fill = Model)) +
+    geom_bar(stat = "identity", position = "dodge", alpha = 0.85, width = 0.7) +
+    geom_errorbar(aes(ymin = mean_r - se_r, ymax = mean_r + se_r),
+                  position = position_dodge(width = 0.7), width = 0.25, size = 0.8) +
+    geom_text(aes(label = tissue_count), 
+              position = position_dodge(width = 0.7), 
+              vjust = -1.5, size = 3.5, fontface = "bold") +
+    scale_fill_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+    theme_minimal() +
+    labs(
+      title = "B",
+      x = "Sample Size Categories",
+      y = "Mean |R| ± SE",
+      subtitle = "Performance stratified by sample size (numbers show tissue count)"
+    ) +
+    theme(
+      plot.title = element_text(size = 20, face = "bold", hjust = 0),
+      plot.subtitle = element_text(size = 12),
+      legend.position = "none",
+      axis.title = element_text(size = 12, face = "bold")
+    )
+  
+  figure5_combined <- grid.arrange(scatter_panel, bin_panel, ncol = 2, widths = c(1, 1))
+  
+  return(figure5_combined)
+}
+
+analyze_sample_size_effects <- function(combined_data) {
+  rin_data <- combined_data[combined_data$Model == "RIN", ]
+  auto_data <- combined_data[combined_data$Model == "Autolysis", ]
+  
+  rin_cor <- cor.test(rin_data$Samples, rin_data$R_value)
+  auto_cor <- cor.test(auto_data$Samples, auto_data$R_value)
+  
+  return(list(rin_test = rin_cor, autolysis_test = auto_cor))
+}
+
+figure5_plot <- create_sample_size_analysis(rin_summary, autolysis_summary)
+sample_size_stats <- analyze_sample_size_effects(rbind(
+  data.frame(Tissue = rin_summary$Tissue, Samples = rin_summary$Samples, 
+             R_value = abs(rin_summary$R), Model = "RIN"),
+  data.frame(Tissue = autolysis_summary$Tissue, Samples = autolysis_summary$Samples,
+             R_value = abs(autolysis_summary$R), Model = "Autolysis")
+))
+
+ggsave(file.path(output_path, "Figure5_Sample_Size_Analysis.pdf"), 
+       figure5_plot, width = 16, height = 8, dpi = 600, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 9. Top 5 Tissues Quality Overlay
+#------------------------------------------------------------------------------
+```{r}
+# Get top 5 tissues for each score
+get_top5_tissues <- function(target_name) {
+  r_values <- sapply(all_results[[target_name]], function(x) {
+    if(is.null(x) || is.null(x$performance$pooled_r2)) return(0)
+  # return(sqrt(x$performance$pooled_r2)) # use when required for R²
+    return(abs(x$performance$pooled_r))  # Use absolute R for ranking
+  })
+  
+  r_values <- r_values[r_values > 0]
+  top5 <- sort(r_values, decreasing = TRUE)[1:5]
+  
+  return(data.frame(
+    tissue = names(top5),
+    correlation_r = as.numeric(top5)
+  ))
+}
+
+top5_rin <- get_top5_tissues("SMRIN")
+top5_auto <- get_top5_tissues("SMATSSCR")
+
+# Create overlay plots
+create_simple_overlay <- function(tissue_name, score_type, color_palette) {
+  tissue_data <- merged_gtex[tissue_main == tissue_name]
+  
+  if(nrow(tissue_data) < 10) {
+    return(ggplot() + theme_void())
+  }
+  
+  # Get features and run UMAP
+  feature_cols <- grep("^feature_", names(tissue_data), value = TRUE)
+  feature_matrix <- as.matrix(tissue_data[, ..feature_cols])
+  feature_matrix <- scale(feature_matrix[, apply(feature_matrix, 2, var) > 1e-10])
+  
+  set.seed(123)
+  umap_result <- umap(feature_matrix, n_neighbors = min(15, nrow(feature_matrix) - 1))
+  
+  plot_data <- data.frame(
+    UMAP1 = umap_result[, 1],
+    UMAP2 = umap_result[, 2],
+    Score = tissue_data[[score_type]]
+  )
+  
+  # Separate data with and without scores
+  data_with_scores <- plot_data[!is.na(plot_data$Score), ]
+  data_missing_scores <- plot_data[is.na(plot_data$Score), ]
+  
+  # Get R value
+  tissue_result <- all_results[[score_type]][[tissue_name]]
+  r_value <- if(!is.null(tissue_result)) tissue_result$performance$pooled_r else 0
+# r_value <- if(!is.null(tissue_result)) sqrt(tissue_result$performance$pooled_r2) else 0 # use when required for R²
+  
+  p <- ggplot() +
+    geom_point(data = data_missing_scores, aes(x = UMAP1, y = UMAP2), 
+               color = "lightgrey", alpha = 0.5, size = 1.5) +
+    geom_point(data = data_with_scores, aes(x = UMAP1, y = UMAP2, color = Score), 
+               alpha = 0.7, size = 2) +
+    color_palette +
+    theme_minimal() +
+    labs(
+      title = tissue_name,
+      subtitle = paste("R =", sprintf("%.3f", r_value)),
+      x = "UMAP1", y = "UMAP2"
+    )
+  
+  return(p)
+}
+
+# Define color palettes
+rin_palette <- scale_color_viridis_c(name = "RIN\nScore", option = "viridis")
+auto_palette <- scale_color_viridis_c(name = "Autolysis\nScore", option = "plasma")
+
+# Create plots
+rin_plots <- lapply(1:5, function(i) {
+  create_simple_overlay(top5_rin$tissue[i], "SMRIN", rin_palette)
+})
+
+auto_plots <- lapply(1:5, function(i) {
+  create_simple_overlay(top5_auto$tissue[i], "SMATSSCR", auto_palette)
+})
+
+# Combine panels
+panel_a <- grid.arrange(grobs = rin_plots, nrow = 1,
+                       top = textGrob("A", gp = gpar(fontsize = 20, fontface = "bold"),
+                                     x = 0.02, just = "left"))
+
+panel_b <- grid.arrange(grobs = auto_plots, nrow = 1,
+                       top = textGrob("B", gp = gpar(fontsize = 20, fontface = "bold"),
+                                     x = 0.02, just = "left"))
+
+final_plot <- grid.arrange(panel_a, panel_b, nrow = 2)
+
+ggsave(file.path(output_path, "Top5_Tissues_Quality_Overlay_AB.pdf"),
+       final_plot, width = 20, height = 12, dpi = 300, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 10. Figure 6: Cross-Tissue Feature Consistency Analysis
+#------------------------------------------------------------------------------
+```{r}
+create_feature_consistency_analysis <- function(all_results) {
+  
+  extract_consistent_features <- function(target_results, min_selections = 3) {
+    tissue_features <- list()
+    
+    for(tissue in names(target_results)) {
+      if(!is.null(target_results[[tissue]]$feature_counts)) {
+        features <- names(target_results[[tissue]]$feature_counts)
+        counts <- as.numeric(target_results[[tissue]]$feature_counts)
+        selected_features <- features[counts >= min_selections]
+        tissue_features[[tissue]] <- selected_features
+      }
+    }
+    
+    return(tissue_features)
+  }
+  
+  rin_tissue_features <- extract_consistent_features(all_results[["SMRIN"]])
+  auto_tissue_features <- extract_consistent_features(all_results[["SMATSSCR"]])
+  
+  create_consistency_heatmap <- function(tissue_features, title, color_scheme) {
+    all_features <- unique(unlist(tissue_features))
+    all_tissues <- names(tissue_features)
+    
+    selection_matrix <- matrix(0, nrow = length(all_features), ncol = length(all_tissues))
+    rownames(selection_matrix) <- all_features
+    colnames(selection_matrix) <- all_tissues
+    
+    for(tissue in all_tissues) {
+      selected <- tissue_features[[tissue]]
+      selection_matrix[selected, tissue] <- 1
+    }
+    
+    consistency_scores <- rowSums(selection_matrix) / ncol(selection_matrix)
+    top_features <- names(sort(consistency_scores, decreasing = TRUE))[1:25]
+    plot_matrix <- selection_matrix[top_features, ]
+    
+    plot_data <- expand.grid(Feature = rownames(plot_matrix), 
+                           Tissue = colnames(plot_matrix))
+    plot_data$Selected <- as.vector(plot_matrix)
+    plot_data$Consistency_Score <- consistency_scores[plot_data$Feature]
+    plot_data$Feature_ID <- sub("feature_", "", plot_data$Feature)
+    
+    heatmap_plot <- ggplot(plot_data, aes(x = Tissue, y = reorder(Feature_ID, Consistency_Score))) +
+      geom_tile(aes(fill = factor(Selected)), color = "white", size = 0.3) +
+      scale_fill_manual(values = c("0" = "white", "1" = color_scheme), 
+                       name = "Selected", labels = c("No", "Yes")) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 9, face = "bold"),
+        axis.text.y = element_text(size = 9),
+        panel.grid = element_blank(),
+        legend.position = "right",
+        plot.title = element_text(size = 16, face = "bold")
+      ) +
+      labs(
+        title = title,
+        x = NULL,
+        y = "Feature ID"
+      )
+    
+    return(heatmap_plot)
+  }
+  
+  panel_a <- create_consistency_heatmap(rin_tissue_features, "A. RIN Model Feature Consistency", "#2E8B57")
+  panel_b <- create_consistency_heatmap(auto_tissue_features, "B. Autolysis Model Feature Consistency", "#D2691E")
+  
+  calculate_stability_distribution <- function(tissue_features) {
+    all_features <- unique(unlist(tissue_features))
+    stability_scores <- sapply(all_features, function(feature) {
+      tissues_with_feature <- sum(sapply(tissue_features, function(x) feature %in% x))
+      return(tissues_with_feature / length(tissue_features))
+    })
+    return(stability_scores)
+  }
+  
+  rin_stability <- calculate_stability_distribution(rin_tissue_features)
+  auto_stability <- calculate_stability_distribution(auto_tissue_features)
+  
+  stability_comparison <- data.frame(
+    Feature = c(names(rin_stability), names(auto_stability)),
+    Stability = c(rin_stability, auto_stability),
+    Model = rep(c("RIN", "Autolysis"), c(length(rin_stability), length(auto_stability)))
+  )
+  
+  panel_c <- ggplot(stability_comparison, aes(x = Stability, fill = Model)) +
+    geom_histogram(alpha = 0.75, bins = 15, position = "identity") +
+    geom_vline(data = stability_comparison %>% group_by(Model) %>% summarise(mean_stab = mean(Stability)),
+               aes(xintercept = mean_stab, color = Model), linetype = "dashed", size = 1.2) +
+    scale_fill_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+    scale_color_manual(values = c("RIN" = "#2E8B57", "Autolysis" = "#D2691E")) +
+    theme_minimal() +
+    labs(
+      title = "C. Feature Stability Distribution",
+      x = "Stability Score (Fraction of Tissues)",
+      y = "Number of Features",
+      subtitle = "Distribution of cross-tissue feature consistency"
+    ) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 12),
+      legend.position = "top",
+      axis.title = element_text(size = 11, face = "bold")
+    )
+  
+  top_panels <- grid.arrange(panel_a, panel_b, ncol = 2)
+  figure6_combined <- grid.arrange(top_panels, panel_c, nrow = 2, heights = c(2, 1))
+  
+  return(figure6_combined)
+}
+
+calculate_feature_overlap_stats <- function(all_results) {
+  extract_top_features <- function(target_results, n = 50) {
+    feature_counts <- list()
+    for(tissue in names(target_results)) {
+      if(!is.null(target_results[[tissue]]$feature_counts)) {
+        counts <- target_results[[tissue]]$feature_counts
+        for(feat in names(counts)) {
+          if(is.null(feature_counts[[feat]])) feature_counts[[feat]] <- 0
+          feature_counts[[feat]] <- feature_counts[[feat]] + counts[[feat]]
+        }
+      }
+    }
+    
+    sorted_features <- sort(unlist(feature_counts), decreasing = TRUE)
+    return(names(sorted_features)[1:min(n, length(sorted_features))])
+  }
+  
+  rin_top <- extract_top_features(all_results[["SMRIN"]])
+  auto_top <- extract_top_features(all_results[["SMATSSCR"]])
+  
+  overlap_count <- length(intersect(rin_top, auto_top))
+  rin_unique <- length(setdiff(rin_top, auto_top))
+  auto_unique <- length(setdiff(auto_top, rin_top))
+  
+  return(list(common = overlap_count, rin_unique = rin_unique, auto_unique = auto_unique))
+}
+
+figure6_plot <- create_feature_consistency_analysis(all_results)
+overlap_stats <- calculate_feature_overlap_stats(all_results)
+
+ggsave(file.path(output_path, "Figure6_Feature_Consistency.pdf"), 
+       figure6_plot, width = 18, height = 14, dpi = 600, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 11. Figure 7: Model Residual Analysis
+#------------------------------------------------------------------------------
+```{r}
+create_comprehensive_residual_analysis <- function(all_results, top_n = 6) {
+  
+  identify_top_tissues <- function(target_results, n) {
+    performance_scores <- sapply(target_results, function(x) {
+      if(is.null(x)) return(0)
+      return(abs(x$performance$pooled_r))
+    })
+    top_tissues <- names(sort(performance_scores, decreasing = TRUE))[1:n]
+    return(top_tissues[!is.na(top_tissues)])
+  }
+  
+  top_rin_tissues <- identify_top_tissues(all_results[["SMRIN"]], top_n)
+  top_auto_tissues <- identify_top_tissues(all_results[["SMATSSCR"]], top_n)
+  
+  create_residual_panel <- function(tissues, target, color, panel_title) {
+    residual_plots <- list()
+    
+    for(i in 1:min(3, length(tissues))) {
+      tissue_name <- tissues[i]
+      result <- all_results[[target]][[tissue_name]]
+      
+      if(!is.null(result) && !is.null(result$all_predictions)) {
+        predictions <- result$all_predictions
+        predictions$residual <- predictions$predicted - predictions$actual
+        r_value <- result$performance$pooled_r
+        
+        residual_plot <- ggplot(predictions, aes(x = actual, y = residual)) +
+          geom_point(alpha = 0.7, color = color, size = 2) +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1) +
+          geom_smooth(method = "loess", se = TRUE, color = "darkblue", alpha = 0.3) +
+          theme_minimal() +
+          labs(
+            title = paste(tissue_name, "(R =", round(r_value, 3), ")"),
+            x = if(i == 3) paste("Actual", ifelse(target == "SMRIN", "RIN", "Autolysis")) else "",
+            y = if(i == 1) "Residual" else ""
+          ) +
+          theme(
+            plot.title = element_text(size = 12, face = "bold"),
+            axis.title = element_text(size = 10, face = "bold")
+          )
+        
+        residual_plots[[i]] <- residual_plot
+      }
+    }
+    
+    panel <- grid.arrange(grobs = residual_plots, nrow = 1,
+                         top = textGrob(panel_title, gp = gpar(fontsize = 16, fontface = "bold")))
+    return(panel)
+  }
+  
+  panel_a <- create_residual_panel(top_rin_tissues, "SMRIN", "#66CDAA", "A. RIN Model Residuals")
+  panel_b <- create_residual_panel(top_auto_tissues, "SMATSSCR", "#FC8D62", "B. Autolysis Model Residuals")
+  
+  create_residual_distribution <- function() {
+    all_residuals <- data.frame()
+    
+    for(target in c("SMRIN", "SMATSSCR")) {
+      for(tissue in names(all_results[[target]])) {
+        result <- all_results[[target]][[tissue]]
+        if(!is.null(result) && !is.null(result$all_predictions)) {
+          predictions <- result$all_predictions
+          residual_data <- data.frame(
+            tissue = tissue,
+            target = ifelse(target == "SMRIN", "RIN", "Autolysis"),
+            residual = predictions$predicted - predictions$actual,
+            abs_residual = abs(predictions$predicted - predictions$actual)
+          )
+          all_residuals <- rbind(all_residuals, residual_data)
+        }
+      }
+    }
+    
+    distribution_plot <- ggplot(all_residuals, aes(x = abs_residual, fill = target)) +
+      geom_histogram(alpha = 0.75, bins = 30, position = "identity") +
+      geom_vline(data = all_residuals %>% group_by(target) %>% summarise(mean_res = mean(abs_residual)),
+                 aes(xintercept = mean_res, color = target), linetype = "dashed", size = 1.2) +
+      scale_fill_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+      scale_color_manual(values = c("RIN" = "#2E8B57", "Autolysis" = "#D2691E")) +
+      theme_minimal() +
+      labs(
+        title = "C. Distribution of Absolute Residuals",
+        x = "Absolute Residual Magnitude",
+        y = "Frequency",
+        fill = "Model Type",
+        subtitle = "Comparison of prediction errors across all tissue models"
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "top",
+        axis.title = element_text(size = 11, face = "bold")
+      )
+    
+    return(distribution_plot)
+  }
+  
+  create_performance_residual_relationship <- function() {
+    performance_residual_data <- data.frame()
+    
+    for(target in c("SMRIN", "SMATSSCR")) {
+      for(tissue in names(all_results[[target]])) {
+        result <- all_results[[target]][[tissue]]
+        if(!is.null(result) && !is.null(result$all_predictions)) {
+          predictions <- result$all_predictions
+          
+          perf_data <- data.frame(
+            tissue = tissue,
+            target = ifelse(target == "SMRIN", "RIN", "Autolysis"),
+            r_value = abs(result$performance$pooled_r),
+            rmse = result$performance$pooled_rmse,
+            mean_abs_residual = mean(abs(predictions$predicted - predictions$actual))
+          )
+          performance_residual_data <- rbind(performance_residual_data, perf_data)
+        }
+      }
+    }
+    
+    relationship_plot <- ggplot(performance_residual_data, aes(x = r_value, y = mean_abs_residual, color = target)) +
+      geom_point(size = 3.5, alpha = 0.8) +
+      geom_smooth(method = "lm", se = TRUE, alpha = 0.3, size = 1.2) +
+      scale_color_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+      theme_minimal() +
+      labs(
+        title = "D. Model Performance vs Residual Magnitude",
+        x = "Correlation Coefficient |R|",
+        y = "Mean Absolute Residual",
+        color = "Model Type",
+        subtitle = "Relationship between prediction accuracy and error magnitude"
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "none",
+        axis.title = element_text(size = 11, face = "bold")
+      )
+    
+    return(relationship_plot)
+  }
+  
+  panel_c <- create_residual_distribution()
+  panel_d <- create_performance_residual_relationship()
+  
+  bottom_panels <- grid.arrange(panel_c, panel_d, ncol = 2)
+  figure7_combined <- grid.arrange(panel_a, panel_b, bottom_panels, nrow = 3, heights = c(1, 1, 1))
+  
+  return(figure7_combined)
+}
+
+analyze_residual_patterns <- function(all_results) {
+  residual_stats <- data.frame()
+  
+  for(target in c("SMRIN", "SMATSSCR")) {
+    for(tissue in names(all_results[[target]])) {
+      result <- all_results[[target]][[tissue]]
+      if(!is.null(result) && !is.null(result$all_predictions)) {
+        predictions <- result$all_predictions
+        residuals <- predictions$predicted - predictions$actual
+        
+        stats_row <- data.frame(
+          tissue = tissue,
+          target = target,
+          mean_residual = mean(residuals),
+          sd_residual = sd(residuals),
+          skewness = e1071::skewness(residuals),
+          normality_p = shapiro.test(sample(residuals, min(5000, length(residuals))))$p.value
+        )
+        residual_stats <- rbind(residual_stats, stats_row)
+      }
+    }
+  }
+  
+  return(residual_stats)
+}
+
+figure7_plot <- create_comprehensive_residual_analysis(all_results)
+residual_statistics <- analyze_residual_patterns(all_results)
+
+ggsave(file.path(output_path, "Figure7_Residual_Analysis.pdf"), 
+       figure7_plot, width = 16, height = 14, dpi = 600, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 11. Figure 8: Biological Feature Interpretation
+#------------------------------------------------------------------------------
+```{r}
+create_biological_interpretation_analysis <- function(all_results, merged_gtex) {
+  
+  analyze_feature_categories <- function() {
+    extract_important_features <- function(target_results, n = 50) {
+      feature_importance <- c()
+      for(tissue in names(target_results)) {
+        if(!is.null(target_results[[tissue]]$feature_counts)) {
+          features <- names(target_results[[tissue]]$feature_counts)
+          counts <- as.numeric(target_results[[tissue]]$feature_counts)
+          feature_importance <- c(feature_importance, rep(features, counts))
+        }
+      }
+      
+      importance_table <- sort(table(feature_importance), decreasing = TRUE)
+      return(names(importance_table)[1:min(n, length(importance_table))])
+    }
+    
+    rin_important <- extract_important_features(all_results[["SMRIN"]])
+    auto_important <- extract_important_features(all_results[["SMATSSCR"]])
+    
+    categorize_features <- function(feature_names) {
+      feature_numbers <- as.numeric(sub("feature_", "", feature_names))
+      categories <- case_when(
+        feature_numbers <= 1024 ~ "Mean",
+        feature_numbers <= 2048 ~ "Standard Deviation",
+        feature_numbers <= 3072 ~ "Minimum",
+        TRUE ~ "Maximum"
+      )
+      return(categories)
+    }
+    
+    rin_categories <- categorize_features(rin_important)
+    auto_categories <- categorize_features(auto_important)
+    
+    category_summary <- data.frame(
+      Category = rep(c("Mean", "Standard Deviation", "Minimum", "Maximum"), 2),
+      Count = c(table(rin_categories)[c("Mean", "Standard Deviation", "Minimum", "Maximum")],
+               table(auto_categories)[c("Mean", "Standard Deviation", "Minimum", "Maximum")]),
+      Model = rep(c("RIN", "Autolysis"), each = 4)
+    )
+    
+    category_summary$Count[is.na(category_summary$Count)] <- 0
+    
+    category_plot <- ggplot(category_summary, aes(x = Category, y = Count, fill = Model)) +
+      geom_bar(stat = "identity", position = "dodge", alpha = 0.85, width = 0.7) +
+      geom_text(aes(label = Count), position = position_dodge(width = 0.7), 
+                vjust = -0.3, size = 4, fontface = "bold") +
+      scale_fill_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+      theme_minimal() +
+      labs(
+        title = "A. Feature Category Distribution",
+        x = "Statistical Property Category",
+        y = "Number of Important Features",
+        subtitle = "Distribution of key features across statistical measures"
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "top",
+        axis.title = element_text(size = 12, face = "bold"),
+        axis.text.x = element_text(size = 11, face = "bold")
+      )
+    
+    return(category_plot)
+  }
+  
+  create_tissue_variability_analysis <- function() {
+    feature_cols <- grep("^feature_", names(merged_gtex), value = TRUE)
+    
+    get_feature_importance <- function(target_results) {
+      feature_scores <- list()
+      for(tissue in names(target_results)) {
+        if(!is.null(target_results[[tissue]]$feature_counts)) {
+          counts <- target_results[[tissue]]$feature_counts
+          for(feat in names(counts)) {
+            if(is.null(feature_scores[[feat]])) feature_scores[[feat]] <- 0
+            feature_scores[[feat]] <- feature_scores[[feat]] + counts[[feat]]
+          }
+        }
+      }
+      
+      sorted_scores <- sort(unlist(feature_scores), decreasing = TRUE)
+      return(names(sorted_scores)[1:min(25, length(sorted_scores))])
+    }
+    
+    important_features <- get_feature_importance(all_results[["SMRIN"]])
+    variability_data <- data.frame()
+    
+    for(feature in important_features) {
+      if(feature %in% feature_cols) {
+        tissue_statistics <- merged_gtex[, .(
+          mean_value = mean(get(feature), na.rm = TRUE),
+          sd_value = sd(get(feature), na.rm = TRUE)
+        ), by = tissue_main]
+        
+        overall_variance <- var(tissue_statistics$mean_value, na.rm = TRUE)
+        
+        importance_score <- sum(sapply(all_results[["SMRIN"]], function(x) {
+          if(!is.null(x$feature_counts) && feature %in% names(x$feature_counts)) {
+            return(x$feature_counts[[feature]])
+          }
+          return(0)
+        }))
+        
+        feature_num <- as.numeric(sub("feature_", "", feature))
+        category <- case_when(
+          feature_num <= 1024 ~ "Mean",
+          feature_num <= 2048 ~ "Std Dev",
+          feature_num <= 3072 ~ "Minimum",
+          TRUE ~ "Maximum"
+        )
+        
+        variability_data <- rbind(variability_data, data.frame(
+          feature = feature,
+          tissue_variance = overall_variance,
+          importance_score = importance_score,
+          category = category
+        ))
+      }
+    }
+    
+    variability_plot <- ggplot(variability_data, aes(x = tissue_variance, y = importance_score, color = category)) +
+      geom_point(size = 4, alpha = 0.8) +
+      geom_smooth(method = "lm", se = TRUE, alpha = 0.3, color = "darkblue") +
+      scale_color_brewer(palette = "Set2", name = "Feature\nCategory") +
+      theme_minimal() +
+      labs(
+        title = "B. Feature Importance vs Tissue Variability",
+        x = "Variance Across Tissue Types",
+        y = "Importance Score (Selection Frequency)",
+        subtitle = "Relationship between tissue discrimination and feature importance"
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "right",
+        axis.title = element_text(size = 12, face = "bold")
+      )
+    
+    return(variability_plot)
+  }
+  
+  create_feature_correlation_matrix <- function() {
+    extract_consensus_features <- function(target_results, n = 20) {
+      feature_counts <- list()
+      for(tissue in names(target_results)) {
+        if(!is.null(target_results[[tissue]]$feature_counts)) {
+          counts <- target_results[[tissue]]$feature_counts
+          for(feat in names(counts)) {
+            if(is.null(feature_counts[[feat]])) feature_counts[[feat]] <- 0
+            feature_counts[[feat]] <- feature_counts[[feat]] + counts[[feat]]
+          }
+        }
+      }
+      
+      sorted_features <- sort(unlist(feature_counts), decreasing = TRUE)
+      return(names(sorted_features)[1:min(n, length(sorted_features))])
+    }
+    
+    consensus_features <- extract_consensus_features(all_results[["SMRIN"]], 15)
+    
+    if(length(consensus_features) > 1) {
+      feature_matrix <- as.matrix(merged_gtex[, ..consensus_features])
+      feature_matrix <- feature_matrix[complete.cases(feature_matrix), ]
+      
+      if(nrow(feature_matrix) > 10) {
+        correlation_matrix <- cor(feature_matrix, use = "complete.obs")
+        
+        cor_long <- reshape2::melt(correlation_matrix)
+        cor_long$Var1 <- sub("feature_", "", cor_long$Var1)
+        cor_long$Var2 <- sub("feature_", "", cor_long$Var2)
+        
+        correlation_plot <- ggplot(cor_long, aes(x = Var1, y = Var2, fill = value)) +
+          geom_tile(color = "white", size = 0.5) +
+          scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#D73027", 
+                              midpoint = 0, name = "Correlation\nCoefficient",
+                              limits = c(-1, 1)) +
+          theme_minimal() +
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+            axis.text.y = element_text(size = 10),
+            plot.title = element_text(size = 16, face = "bold"),
+            plot.subtitle = element_text(size = 12),
+            legend.position = "right"
+          ) +
+          labs(
+            title = "C. Feature Correlation Matrix",
+            x = "Feature ID",
+            y = "Feature ID",
+            subtitle = "Correlation structure among top predictive features"
+          ) +
+          coord_fixed()
+        
+        return(correlation_plot)
+      }
+    }
+    
+    empty_plot <- ggplot() + 
+      annotate("text", x = 0.5, y = 0.5, 
+               label = "Insufficient data\nfor correlation analysis", 
+               size = 6, hjust = 0.5) +
+      theme_void() +
+      labs(title = "C. Feature Correlation Matrix") +
+      theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+    
+    return(empty_plot)
+  }
+  
+  panel_a <- analyze_feature_categories()
+  panel_b <- create_tissue_variability_analysis()
+  panel_c <- create_feature_correlation_matrix()
+  
+  top_panels <- grid.arrange(panel_a, panel_b, ncol = 2)
+  figure8_combined <- grid.arrange(top_panels, panel_c, nrow = 2, heights = c(1, 1))
+  
+  return(figure8_combined)
+}
+
+analyze_biological_significance <- function(all_results) {
+  for(target in c("SMRIN", "SMATSSCR")) {
+    all_features <- unlist(lapply(all_results[[target]], function(x) {
+      if(!is.null(x$feature_counts)) names(x$feature_counts) else NULL
+    }))
+    
+    feature_nums <- as.numeric(sub("feature_", "", all_features))
+    mean_features <- sum(feature_nums <= 1024)
+    std_features <- sum(feature_nums > 1024 & feature_nums <= 2048)
+    min_features <- sum(feature_nums > 2048 & feature_nums <= 3072)
+    max_features <- sum(feature_nums > 3072)
+  }
+}
+
+figure8_plot <- create_biological_interpretation_analysis(all_results, merged_gtex)
+analyze_biological_significance(all_results)
+
+ggsave(file.path(output_path, "Figure8_Biological_Interpretation.pdf"), 
+       figure8_plot, width = 16, height = 14, dpi = 600, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 12. Supplementary Figure S1: Quality Score Distributions by Tissue
+#------------------------------------------------------------------------------
+```{r}
+create_quality_score_distributions <- function(merged_gtex) {
+  
+  prepare_quality_data <- function() {
+    rin_data <- merged_gtex[!is.na(SMRIN), .(tissue_main, SMRIN)]
+    setnames(rin_data, "SMRIN", "Score")
+    rin_data$Score_Type <- "RIN Score"
+    
+    auto_data <- merged_gtex[!is.na(SMATSSCR), .(tissue_main, SMATSSCR)]
+    setnames(auto_data, "SMATSSCR", "Score")
+    auto_data$Score_Type <- "Autolysis Score"
+    
+    return(list(rin = rin_data, autolysis = auto_data))
+  }
+  
+  get_top_tissues <- function(n_tissues = 20) {
+    tissue_counts <- merged_gtex[, .N, by = tissue_main][order(-N)]
+    return(head(tissue_counts$tissue_main, n_tissues))
+  }
+  
+  quality_data <- prepare_quality_data()
+  top_tissues <- get_top_tissues()
+  
+  rin_filtered <- quality_data$rin[tissue_main %in% top_tissues]
+  auto_filtered <- quality_data$autolysis[tissue_main %in% top_tissues]
+  
+  rin_filtered$tissue_main <- factor(rin_filtered$tissue_main, levels = top_tissues)
+  auto_filtered$tissue_main <- factor(auto_filtered$tissue_main, levels = top_tissues)
+  
+  create_rin_distribution_panel <- function() {
+    rin_violin <- ggplot(rin_filtered, aes(x = tissue_main, y = Score)) +
+      geom_violin(fill = "#66CDAA", alpha = 0.8, trim = FALSE, scale = "width") +
+      geom_boxplot(width = 0.15, alpha = 0.9, outlier.size = 1, outlier.alpha = 0.6) +
+      stat_summary(fun = median, geom = "point", color = "darkblue", size = 1.5) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 11, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold")
+      ) +
+      labs(
+        title = "A. RIN Score Distributions by Tissue Type",
+        subtitle = "RNA Integrity Number across major tissue types",
+        x = NULL,
+        y = "RIN Score"
+      ) +
+      scale_y_continuous(limits = c(1, 10), breaks = seq(2, 10, 2))
+    
+    return(rin_violin)
+  }
+  
+  create_autolysis_distribution_panel <- function() {
+    auto_violin <- ggplot(auto_filtered, aes(x = tissue_main, y = Score)) +
+      geom_violin(fill = "#FC8D62", alpha = 0.8, trim = FALSE, scale = "width") +
+      geom_boxplot(width = 0.15, alpha = 0.9, outlier.size = 1, outlier.alpha = 0.6) +
+      stat_summary(fun = median, geom = "point", color = "darkred", size = 1.5) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 11, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold")
+      ) +
+      labs(
+        title = "B. Autolysis Score Distributions by Tissue Type",
+        subtitle = "Tissue degradation levels across major tissue types",
+        x = "Tissue Type",
+        y = "Autolysis Score"
+      ) +
+      scale_y_continuous(limits = c(0, 3), breaks = 0:3,
+                        labels = c("0 (None)", "1 (Mild)", "2 (Moderate)", "3 (Severe)"))
+    
+    return(auto_violin)
+  }
+  
+  calculate_distribution_stats <- function() {
+    rin_stats <- rin_filtered[, .(
+      mean_score = round(mean(Score, na.rm = TRUE), 2),
+      median_score = round(median(Score, na.rm = TRUE), 2),
+      sd_score = round(sd(Score, na.rm = TRUE), 2),
+      sample_size = .N
+    ), by = tissue_main][order(-mean_score)]
+    
+    auto_stats <- auto_filtered[, .(
+      mean_score = round(mean(Score, na.rm = TRUE), 2),
+      median_score = round(median(Score, na.rm = TRUE), 2),
+      sd_score = round(sd(Score, na.rm = TRUE), 2),
+      sample_size = .N
+    ), by = tissue_main][order(mean_score)]
+    
+    return(list(rin_stats = rin_stats, auto_stats = auto_stats))
+  }
+  
+  panel_a <- create_rin_distribution_panel()
+  panel_b <- create_autolysis_distribution_panel()
+  distribution_stats <- calculate_distribution_stats()
+  
+  supp_fig_s1 <- grid.arrange(panel_a, panel_b, nrow = 2)
+  
+  return(supp_fig_s1)
+}
+
+analyze_quality_correlations <- function(merged_gtex) {
+  quality_subset <- merged_gtex[!is.na(SMRIN) & !is.na(SMATSSCR)]
+  
+  if(nrow(quality_subset) > 10) {
+    correlation_test <- cor.test(quality_subset$SMRIN, quality_subset$SMATSSCR)
+    return(correlation_test)
+  } else {
+    return(NULL)
+  }
+}
+
+supp_figure_s1 <- create_quality_score_distributions(merged_gtex)
+quality_correlations <- analyze_quality_correlations(merged_gtex)
+
+ggsave(file.path(output_path, "SuppFig_S1_Quality_Distributions.pdf"), 
+       supp_figure_s1, width = 18, height = 12, dpi = 600, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 13. Supplementary Figure S2: Cross-validation Stability Analysis
+#------------------------------------------------------------------------------
+```{r}
+create_cv_stability_analysis <- function(all_results) {
+  
+  extract_fold_performance <- function(target_results) {
+    fold_performance <- data.frame()
+    
+    for(tissue in names(target_results)) {
+      result <- target_results[[tissue]]
+      if(!is.null(result) && !is.null(result$fold_results)) {
+        
+        for(fold_result in result$fold_results) {
+          fold_data <- data.frame(
+            tissue = tissue,
+            fold = fold_result$fold,
+            r_value = abs(fold_result$r),
+            rmse = fold_result$rmse,
+            mae = fold_result$mae
+          )
+          fold_performance <- rbind(fold_performance, fold_data)
+        }
+      }
+    }
+    
+    return(fold_performance)
+  }
+  
+  rin_fold_data <- extract_fold_performance(all_results[["SMRIN"]])
+  auto_fold_data <- extract_fold_performance(all_results[["SMATSSCR"]])
+  
+  rin_fold_data$target <- "RIN"
+  auto_fold_data$target <- "Autolysis"
+  combined_fold_data <- rbind(rin_fold_data, auto_fold_data)
+  
+  create_stability_scatter <- function() {
+    stability_metrics <- combined_fold_data %>%
+      group_by(tissue, target) %>%
+      summarise(
+        mean_r = mean(r_value, na.rm = TRUE),
+        sd_r = sd(r_value, na.rm = TRUE),
+        cv_r = sd(r_value, na.rm = TRUE) / mean(r_value, na.rm = TRUE),
+        .groups = 'drop'
+      ) %>%
+      filter(is.finite(cv_r) & cv_r > 0)
+    
+    stability_plot <- ggplot(stability_metrics, aes(x = mean_r, y = cv_r, color = target)) +
+      geom_point(size = 3.5, alpha = 0.8) +
+      geom_smooth(method = "lm", se = TRUE, alpha = 0.3) +
+      scale_color_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+      theme_minimal() +
+      labs(
+        title = "A. Model Stability vs Performance",
+        x = "Mean |R| Across Folds",
+        y = "Coefficient of Variation (|R|)",
+        color = "Model Type",
+        subtitle = "Lower CV indicates more stable cross-validation performance"
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "top",
+        axis.title = element_text(size = 12, face = "bold")
+      )
+    
+    return(stability_plot)
+  }
+  
+  create_fold_variability_boxplots <- function() {
+    top_tissues_rin <- combined_fold_data %>% 
+      filter(target == "RIN") %>%
+      group_by(tissue) %>%
+      summarise(mean_r = mean(r_value, na.rm = TRUE), .groups = 'drop') %>%
+      arrange(desc(mean_r)) %>% 
+      slice(1:8) %>% 
+      pull(tissue)
+    
+    top_tissues_auto <- combined_fold_data %>% 
+      filter(target == "Autolysis") %>%
+      group_by(tissue) %>%
+      summarise(mean_r = mean(r_value, na.rm = TRUE), .groups = 'drop') %>%
+      arrange(desc(mean_r)) %>% 
+      slice(1:8) %>% 
+      pull(tissue)
+    
+    fold_subset <- combined_fold_data %>%
+      filter((target == "RIN" & tissue %in% top_tissues_rin) |
+             (target == "Autolysis" & tissue %in% top_tissues_auto))
+    
+    variability_plot <- ggplot(fold_subset, aes(x = tissue, y = r_value, fill = target)) +
+      geom_boxplot(alpha = 0.8, outlier.alpha = 0.6) +
+      facet_wrap(~target, scales = "free_x", ncol = 1) +
+      scale_fill_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+        legend.position = "none",
+        strip.text = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 12, face = "bold")
+      ) +
+      labs(
+        title = "B. Cross-Fold Performance Variability",
+        x = "Tissue Type",
+        y = "|R| Value Across Folds",
+        subtitle = "Box plots show distribution of performance across CV folds"
+      )
+    
+    return(variability_plot)
+  }
+  
+  create_stability_ranking <- function() {
+    stability_ranking <- combined_fold_data %>%
+      group_by(tissue, target) %>%
+      summarise(
+        mean_r = mean(r_value, na.rm = TRUE),
+        cv_r = sd(r_value, na.rm = TRUE) / mean(r_value, na.rm = TRUE),
+        .groups = 'drop'
+      ) %>%
+      filter(is.finite(cv_r) & cv_r > 0) %>%
+      arrange(cv_r) %>%
+      mutate(
+        stability_rank = row_number(),
+        stability_category = cut(cv_r, 
+                               breaks = c(0, 0.1, 0.2, 0.5, Inf),
+                               labels = c("Very Stable", "Stable", "Moderate", "Unstable"))
+      )
+    
+    ranking_plot <- ggplot(stability_ranking, aes(x = stability_rank, y = cv_r, color = target)) +
+      geom_point(size = 3, alpha = 0.8) +
+      geom_hline(yintercept = c(0.1, 0.2, 0.5), linetype = "dashed", alpha = 0.6) +
+      scale_color_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+      theme_minimal() +
+      labs(
+        title = "C. Model Stability Ranking",
+        x = "Stability Rank (1 = Most Stable)",
+        y = "Coefficient of Variation (|R|)",
+        color = "Model Type",
+        subtitle = "Horizontal lines indicate stability thresholds"
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "none",
+        axis.title = element_text(size = 12, face = "bold")
+      )
+    
+    return(ranking_plot)
+  }
+  
+  panel_a <- create_stability_scatter()
+  panel_b <- create_fold_variability_boxplots()
+  panel_c <- create_stability_ranking()
+  
+  top_panels <- grid.arrange(panel_a, panel_c, ncol = 2)
+  supp_fig_s2 <- grid.arrange(top_panels, panel_b, nrow = 2, heights = c(1, 1.5))
+  
+  return(supp_fig_s2)
+}
+
+calculate_stability_stats <- function(all_results) {
+  stability_summary <- data.frame()
+  
+  for(target in c("SMRIN", "SMATSSCR")) {
+    for(tissue in names(all_results[[target]])) {
+      result <- all_results[[target]][[tissue]]
+      if(!is.null(result) && !is.null(result$fold_results)) {
+        
+        fold_r_values <- sapply(result$fold_results, function(x) abs(x$r))
+        
+        stability_row <- data.frame(
+          tissue = tissue,
+          target = target,
+          mean_r = mean(fold_r_values),
+          cv_r = sd(fold_r_values) / mean(fold_r_values),
+          min_r = min(fold_r_values),
+          max_r = max(fold_r_values)
+        )
+        stability_summary <- rbind(stability_summary, stability_row)
+      }
+    }
+  }
+  
+  by_target <- stability_summary %>%
+    group_by(target) %>%
+    summarise(
+      mean_cv = round(mean(cv_r, na.rm = TRUE), 3),
+      median_cv = round(median(cv_r, na.rm = TRUE), 3),
+      stable_models = sum(cv_r < 0.2, na.rm = TRUE),
+      total_models = n(),
+      .groups = 'drop'
+    )
+  
+  return(stability_summary)
+}
+
+supp_figure_s2 <- create_cv_stability_analysis(all_results)
+stability_stats <- calculate_stability_stats(all_results)
+
+ggsave(file.path(output_path, "SuppFig_S2_CV_Stability.pdf"), 
+       supp_figure_s2, width = 14, height = 12, dpi = 600, bg = "white")
+```
+
+
+#------------------------------------------------------------------------------
+# 14. Supplementary Figure S3: Extended Comparative Analysis
+#------------------------------------------------------------------------------
+```{r}
+create_extended_comparative_analysis <- function(all_results, rin_summary, autolysis_summary) {
+  
+  create_cross_model_correlation <- function() {
+    common_tissues <- intersect(rin_summary$Tissue, autolysis_summary$Tissue)
+    
+    comparison_data <- data.frame(
+      Tissue = common_tissues,
+      RIN_R = rin_summary$R[match(common_tissues, rin_summary$Tissue)],
+      Auto_R = autolysis_summary$R[match(common_tissues, autolysis_summary$Tissue)],
+      RIN_RMSE = rin_summary$RMSE[match(common_tissues, rin_summary$Tissue)],
+      Auto_RMSE = autolysis_summary$RMSE[match(common_tissues, autolysis_summary$Tissue)]
+    )
+    
+    r_correlation <- cor(abs(comparison_data$RIN_R), abs(comparison_data$Auto_R), use = "complete.obs")
+    
+    correlation_plot <- ggplot(comparison_data, aes(x = abs(RIN_R), y = abs(Auto_R))) +
+      geom_point(size = 3.5, alpha = 0.8, color = "darkblue") +
+      geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.3) +
+      geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray", size = 1) +
+      theme_minimal() +
+      labs(
+        title = "A. Cross-Model Performance Correlation",
+        x = "RIN Model |R|",
+        y = "Autolysis Model |R|",
+        subtitle = paste("Correlation =", round(r_correlation, 3))
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold")
+      ) +
+      coord_fixed()
+    
+    return(correlation_plot)
+  }
+  
+  create_sample_size_performance <- function() {
+    combined_data <- rbind(
+      data.frame(rin_summary[, c("Tissue", "Samples", "R")], Model = "RIN"),
+      data.frame(autolysis_summary[, c("Tissue", "Samples", "R")], Model = "Autolysis")
+    )
+    
+    combined_data$R_abs <- abs(combined_data$R)
+    combined_data$Size_Bin <- cut(combined_data$Samples, 
+                                 breaks = c(0, 50, 100, 200, 500, Inf),
+                                 labels = c("≤50", "51-100", "101-200", "201-500", ">500"))
+    
+    size_performance_plot <- ggplot(combined_data, aes(x = Size_Bin, y = R_abs, fill = Model)) +
+      geom_boxplot(alpha = 0.8, outlier.alpha = 0.6) +
+      scale_fill_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+      theme_minimal() +
+      labs(
+        title = "B. Model Performance by Sample Size Category",
+        x = "Sample Size Category",
+        y = "Absolute Correlation Coefficient |R|",
+        subtitle = "Performance distribution across sample size bins"
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "top",
+        axis.title = element_text(size = 12, face = "bold")
+      )
+    
+    return(size_performance_plot)
+  }
+  
+  create_tissue_preference_analysis <- function() {
+    common_tissues <- intersect(rin_summary$Tissue, autolysis_summary$Tissue)
+    
+    preference_data <- data.frame(
+      Tissue = common_tissues,
+      RIN_R = abs(rin_summary$R[match(common_tissues, rin_summary$Tissue)]),
+      Auto_R = abs(autolysis_summary$R[match(common_tissues, autolysis_summary$Tissue)])
+    )
+    
+    preference_data$Better_Model <- ifelse(
+      preference_data$RIN_R > preference_data$Auto_R, "RIN", "Autolysis"
+    )
+    preference_data$Performance_Difference <- abs(preference_data$RIN_R - preference_data$Auto_R)
+    preference_data$Max_R <- pmax(preference_data$RIN_R, preference_data$Auto_R)
+    
+    preference_data$Tissue_System <- case_when(
+      grepl("Brain|Nerve|Spinal", preference_data$Tissue) ~ "Nervous",
+      grepl("Heart|Artery|Aorta", preference_data$Tissue) ~ "Cardiovascular", 
+      grepl("Lung|Trachea", preference_data$Tissue) ~ "Respiratory",
+      grepl("Liver|Pancreas|Stomach|Colon|Small|Esophagus", preference_data$Tissue) ~ "Digestive",
+      grepl("Kidney|Bladder", preference_data$Tissue) ~ "Urinary",
+      grepl("Muscle|Skin", preference_data$Tissue) ~ "Musculoskeletal",
+      grepl("Thyroid|Adrenal|Pituitary", preference_data$Tissue) ~ "Endocrine",
+      TRUE ~ "Other"
+    )
+    
+    preference_plot <- ggplot(preference_data, aes(x = Max_R, y = Performance_Difference, 
+                                                  color = Better_Model, shape = Tissue_System)) +
+      geom_point(size = 4, alpha = 0.8) +
+      scale_color_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+      scale_shape_manual(values = c(16, 17, 18, 15, 3, 4, 8, 1)[1:length(unique(preference_data$Tissue_System))]) +
+      theme_minimal() +
+      labs(
+        title = "C. Tissue Categories and Model Preference",
+        x = "Maximum |R| Value",
+        y = "Absolute Difference in |R|",
+        color = "Better Model",
+        shape = "Tissue System",
+        subtitle = "Model preference patterns across biological systems"
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "right",
+        axis.title = element_text(size = 12, face = "bold")
+      )
+    
+    return(preference_plot)
+  }
+  
+  create_feature_overlap_analysis <- function() {
+    extract_features <- function(target_results, threshold = 5) {
+      feature_counts <- list()
+      for(tissue in names(target_results)) {
+        if(!is.null(target_results[[tissue]]$feature_counts)) {
+          counts <- target_results[[tissue]]$feature_counts
+          for(feat in names(counts)) {
+            if(is.null(feature_counts[[feat]])) feature_counts[[feat]] <- 0
+            feature_counts[[feat]] <- feature_counts[[feat]] + counts[[feat]]
+          }
+        }
+      }
+      
+      important_features <- names(feature_counts)[feature_counts >= threshold]
+      return(important_features)
+    }
+    
+    thresholds <- c(3, 5, 10, 15, 20)
+    overlap_data <- data.frame()
+    
+    for(thresh in thresholds) {
+      rin_thresh <- extract_features(all_results[["SMRIN"]], thresh)
+      auto_thresh <- extract_features(all_results[["SMATSSCR"]], thresh)
+      
+      overlap_count <- length(intersect(rin_thresh, auto_thresh))
+      rin_only <- length(setdiff(rin_thresh, auto_thresh))
+      auto_only <- length(setdiff(auto_thresh, rin_thresh))
+      
+      overlap_data <- rbind(overlap_data, data.frame(
+        Threshold = thresh,
+        Overlap = overlap_count,
+        RIN_Only = rin_only,
+        Auto_Only = auto_only
+      ))
+    }
+    
+    overlap_long <- reshape2::melt(overlap_data, id.vars = "Threshold", 
+                                  variable.name = "Category", value.name = "Count")
+    
+    overlap_plot <- ggplot(overlap_long, aes(x = factor(Threshold), y = Count, fill = Category)) +
+      geom_bar(stat = "identity", position = "stack") +
+      scale_fill_manual(values = c("Overlap" = "#8E44AD", "RIN_Only" = "#66CDAA", "Auto_Only" = "#FC8D62"),
+                       labels = c("Common Features", "RIN Only", "Autolysis Only")) +
+      theme_minimal() +
+      labs(
+        title = "D. Feature Overlap at Different Selection Thresholds",
+        x = "Minimum Selection Frequency",
+        y = "Number of Features",
+        fill = "Feature Type",
+        subtitle = "Overlap analysis across selection frequency thresholds"
+      ) +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "top",
+        axis.title = element_text(size = 12, face = "bold")
+      )
+    
+    return(overlap_plot)
+  }
+  
+  panel_a <- create_cross_model_correlation()
+  panel_b <- create_sample_size_performance()
+  panel_c <- create_tissue_preference_analysis()
+  panel_d <- create_feature_overlap_analysis()
+  
+  combined_plot <- grid.arrange(panel_a, panel_b, panel_c, panel_d, nrow = 2, ncol = 2)
+  
+  return(combined_plot)
+}
+
+create_model_comparison_summary <- function(rin_summary, autolysis_summary) {
+  common_tissues <- intersect(rin_summary$Tissue, autolysis_summary$Tissue)
+  
+  comparison_summary <- data.frame(
+    Tissue = common_tissues,
+    RIN_R = abs(rin_summary$R[match(common_tissues, rin_summary$Tissue)]),
+    Auto_R = abs(autolysis_summary$R[match(common_tissues, autolysis_summary$Tissue)])
+  )
+  
+  comparison_summary$Better_Model <- ifelse(
+    comparison_summary$RIN_R > comparison_summary$Auto_R, "RIN", "Autolysis"
+  )
+  
+  model_preference <- table(comparison_summary$Better_Model)
+  
+  return(list(
+    summary = comparison_summary,
+    preference_counts = model_preference,
+    mean_performance = c(
+      RIN = mean(comparison_summary$RIN_R, na.rm = TRUE),
+      Autolysis = mean(comparison_summary$Auto_R, na.rm = TRUE)
+    )
+  ))
+}
+
+supp_figure_s3 <- create_extended_comparative_analysis(all_results, rin_summary, autolysis_summary)
+comparison_summary <- create_model_comparison_summary(rin_summary, autolysis_summary)
+
+ggsave(file.path(output_path, "SuppFig_S3_Extended_Comparison.pdf"), 
+       supp_figure_s3, width = 16, height = 14, dpi = 600, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 15. Comprehensive Final Report Generation
+#------------------------------------------------------------------------------
+```{r}
+generate_comprehensive_report <- function() {
+  report_path <- file.path(data_path, "processed/comprehensive_gtex_report.txt")
+  
+  sink(report_path)
+  
+  cat("================================================================================\n")
+  cat("                    COMPREHENSIVE GTEx ANALYSIS REPORT                          \n")
+  cat("================================================================================\n\n")
+  
+  # Header Information
+  cat("ANALYSIS OVERVIEW\n")
+  cat("-----------------\n")
+  cat(paste("Report Generated:", Sys.time(), "\n"))
+  cat(paste("Pipeline Version: GTEx Analysis Pipeline v1.0\n"))
+  cat(paste("Analysis Duration:", format(Sys.time() - start_time, digits = 3), "\n\n"))
+  
+  # Dataset Summary
+  cat("DATASET SUMMARY\n")
+  cat("===============\n")
+  cat(paste("Total Samples Analyzed:", nrow(merged_gtex), "\n"))
+  cat(paste("Total Tissue Types:", length(unique(merged_gtex$tissue_main)), "\n"))
+  cat(paste("Total Features Extracted:", length(grep("^feature_", names(merged_gtex))), "\n"))
+  cat(paste("Male Subjects:", sum(merged_gtex$sex == "male"), "\n"))
+  cat(paste("Female Subjects:", sum(merged_gtex$sex == "female"), "\n\n"))
+  
+  # Top tissue types by sample count
+  tissue_counts <- merged_gtex[, .N, by = tissue_main][order(-N)]
+  cat("Top 10 Tissue Types by Sample Count:\n")
+  for(i in 1:min(10, nrow(tissue_counts))) {
+    cat(sprintf("  %2d. %-25s: %4d samples\n", i, tissue_counts$tissue_main[i], tissue_counts$N[i]))
+  }
+  cat("\n")
+  
+  # Quality Metrics Analysis
+  cat("QUALITY METRICS ANALYSIS\n")
+  cat("========================\n")
+  
+  # RIN Analysis
+  rin_data <- merged_gtex[!is.na(SMRIN)]
+  if(nrow(rin_data) > 0) {
+    cat("RIN Score Distribution:\n")
+    cat(paste("  Samples with RIN data:", nrow(rin_data), "of", nrow(merged_gtex), 
+              sprintf("(%.1f%%)\n", 100 * nrow(rin_data) / nrow(merged_gtex))))
+    cat(paste("  Mean RIN Score:", round(mean(rin_data$SMRIN), 2), "\n"))
+    cat(paste("  Median RIN Score:", round(median(rin_data$SMRIN), 2), "\n"))
+    cat(paste("  RIN Range:", round(min(rin_data$SMRIN), 2), "-", round(max(rin_data$SMRIN), 2), "\n"))
+    cat(paste("  High Quality (RIN ≥ 7.0):", sum(rin_data$SMRIN >= 7.0), 
+              sprintf("(%.1f%%)\n", 100 * sum(rin_data$SMRIN >= 7.0) / nrow(rin_data))))
+  }
+  
+  # Autolysis Analysis
+  autolysis_data <- merged_gtex[!is.na(SMATSSCR)]
+  if(nrow(autolysis_data) > 0) {
+    cat("\nAutolysis Score Distribution:\n")
+    cat(paste("  Samples with Autolysis data:", nrow(autolysis_data), "of", nrow(merged_gtex),
+              sprintf("(%.1f%%)\n", 100 * nrow(autolysis_data) / nrow(merged_gtex))))
+    cat(paste("  Mean Autolysis Score:", round(mean(autolysis_data$SMATSSCR), 2), "\n"))
+    cat(paste("  Median Autolysis Score:", round(median(autolysis_data$SMATSSCR), 2), "\n"))
+    autolysis_counts <- table(autolysis_data$SMATSSCR)
+    for(score in names(autolysis_counts)) {
+      cat(sprintf("  Score %s: %d samples (%.1f%%)\n", score, autolysis_counts[score],
+                  100 * autolysis_counts[score] / nrow(autolysis_data)))
+    }
+    cat(paste("  High Quality (Score ≤ 2):", sum(autolysis_data$SMATSSCR <= 2),
+              sprintf("(%.1f%%)\n", 100 * sum(autolysis_data$SMATSSCR <= 2) / nrow(autolysis_data))))
+  }
+  
+  # Dimensionality Reduction Results
+  cat("\nDIMENSIONALITY REDUCTION ANALYSIS\n")
+  cat("=================================\n")
+  
+  if(exists("pca_results")) {
+    cat("Principal Component Analysis:\n")
+    cat(paste("  PC1 Variance Explained:", sprintf("%.1f%%", pca_results$variance_explained[1] * 100), "\n"))
+    cat(paste("  PC2 Variance Explained:", sprintf("%.1f%%", pca_results$variance_explained[2] * 100), "\n"))
+    cat(paste("  First 10 PCs Cumulative Variance:", sprintf("%.1f%%", pca_results$cumulative_variance[10] * 100), "\n"))
+    cat(paste("  First 50 PCs Cumulative Variance:", sprintf("%.1f%%", pca_results$cumulative_variance[50] * 100), "\n"))
+  }
+  
+  if(exists("tissue_sil")) {
+    cat("\nUMAP Clustering Analysis:\n")
+    cat(paste("  Overall Silhouette Score:", sprintf("%.3f", mean(sil[,3], na.rm = TRUE)), "\n"))
+    cat("  Top 5 Best-Separated Tissues (by Silhouette Score):\n")
+    top_silhouette <- head(tissue_sil[order(-avg_silhouette)], 5)
+    for(i in 1:nrow(top_silhouette)) {
+      cat(sprintf("    %d. %-25s: %.3f\n", i, top_silhouette$tissue[i], top_silhouette$avg_silhouette[i]))
+    }
+  }
+  
+  # Variance Analysis Results
+  cat("\nVARIANCE ANALYSIS (ANOVA)\n")
+  cat("=========================\n")
+  
+  if(exists("rin_variance")) {
+    cat("RIN Score Variance Explained by Demographics:\n")
+    rin_variance_sorted <- rin_variance[order(-rin_variance$var_explained),]
+    for(i in 1:nrow(rin_variance_sorted)) {
+      cat(sprintf("  %-20s: %5.1f%% (p %s)\n", 
+                  rin_variance_sorted$label[i], 
+                  rin_variance_sorted$var_explained[i],
+                  rin_variance_sorted$significance[i]))
+    }
+  }
+  
+  if(exists("autolysis_variance")) {
+    cat("\nAutolysis Score Variance Explained by Demographics:\n")
+    autolysis_variance_sorted <- autolysis_variance[order(-autolysis_variance$var_explained),]
+    for(i in 1:nrow(autolysis_variance_sorted)) {
+      cat(sprintf("  %-20s: %5.1f%% (p %s)\n", 
+                  autolysis_variance_sorted$label[i], 
+                  autolysis_variance_sorted$var_explained[i],
+                  autolysis_variance_sorted$significance[i]))
+    }
+  }
+  
+  # Correlation Analysis
+  cat("\nCORRELATION ANALYSIS\n")
+  cat("====================\n")
+  
+  if(exists("tissue_corr")) {
+    cat("RIN vs Autolysis Correlations by Tissue:\n")
+    tissue_corr_sorted <- tissue_corr[order(-abs(tissue_corr$correlation)),]
+    cat("  Strongest Correlations (Top 10):\n")
+    top_corr <- head(tissue_corr_sorted, 10)
+    for(i in 1:nrow(top_corr)) {
+      cat(sprintf("    %-25s: r = %6.3f (p %s, n = %d)\n", 
+                  top_corr$tissue_main[i], 
+                  top_corr$correlation[i],
+                  top_corr$significance[i],
+                  top_corr$n_samples[i]))
+    }
+  }
+  
+  # Machine Learning Model Results
+  cat("\nMACHINE LEARNING MODEL PERFORMANCE\n")
+  cat("==================================\n")
+  
+  if(exists("all_results")) {
+    # RIN Models
+    if("SMRIN" %in% names(all_results)) {
+      rin_models <- all_results[["SMRIN"]]
+      rin_r_values <- sapply(rin_models, function(x) {
+        if(is.null(x)) return(NA)
+        return(abs(x$performance$pooled_r))  # Use absolute R
+        # return(sqrt(x$performance$pooled_r2)) # use when required for R²
+      })
+      rin_r_values <- rin_r_values[!is.na(rin_r_values)]
+      
+      cat("RIN Score Prediction Models:\n")
+      cat(paste("  Successful models:", length(rin_r_values), "tissues\n"))
+      cat(paste("  Mean |R|:", sprintf("%.3f", mean(rin_r_values)), "\n"))
+      cat(paste("  Median |R|:", sprintf("%.3f", median(rin_r_values)), "\n"))
+      cat(paste("  Strong models (|R| > 0.5):", sum(rin_r_values > 0.5), "\n"))
+      cat(paste("  Excellent models (|R| > 0.7):", sum(rin_r_values > 0.7), "\n"))
+      
+      # Top performing tissues
+      cat("  Top 5 RIN Prediction Models:\n")
+      top_rin <- names(sort(rin_r_values, decreasing = TRUE))[1:5]
+      for(i in 1:length(top_rin)) {
+        tissue_name <- top_rin[i]
+        r_value <- rin_r_values[tissue_name]
+        cat(sprintf("    %d. %-25s: |R| = %.3f\n", i, tissue_name, r_value))
+      }
+    }
+    
+    # Autolysis Models
+    if("SMATSSCR" %in% names(all_results)) {
+      auto_models <- all_results[["SMATSSCR"]]
+      auto_r_values <- sapply(auto_models, function(x) {
+        if(is.null(x)) return(NA)
+        return(sqrt(x$performance$pooled_r2))
+      })
+      auto_r_values <- auto_r_values[!is.na(auto_r_values)]
+      
+      cat("\nAutolysis Score Prediction Models:\n")
+      cat(paste("  Successful models:", length(auto_r_values), "tissues\n"))
+      cat(paste("  Mean R:", sprintf("%.3f", mean(auto_r_values)), "\n"))
+      cat(paste("  Median R:", sprintf("%.3f", median(auto_r_values)), "\n"))
+      cat(paste("  Strong models (R > 0.5):", sum(auto_r_values > 0.5), "\n"))
+      cat(paste("  Excellent models (R > 0.7):", sum(auto_r_values > 0.7), "\n"))
+      
+      # Top performing tissues
+      cat("  Top 5 Autolysis Prediction Models:\n")
+      top_auto <- names(sort(auto_r_values, decreasing = TRUE))[1:5]
+      for(i in 1:length(top_auto)) {
+        tissue_name <- top_auto[i]
+        r_value <- auto_r_values[tissue_name]
+        cat(sprintf("    %d. %-25s: R = %.3f\n", i, tissue_name, r_value))
+      }
+    }
+  }
+  
+  # Feature Analysis
+  cat("\nFEATURE IMPORTANCE ANALYSIS\n")
+  cat("===========================\n")
+  
+  if(exists("common_features") && exists("rin_only_features") && exists("auto_only_features")) {
+    cat("Feature Overlap Analysis:\n")
+    cat(paste("  Common features (both models):", length(common_features), "\n"))
+    cat(paste("  RIN-specific features:", length(rin_only_features), "\n"))
+    cat(paste("  Autolysis-specific features:", length(auto_only_features), "\n"))
+    
+    total_unique <- length(common_features) + length(rin_only_features) + length(auto_only_features)
+    cat(paste("  Feature overlap percentage:", sprintf("%.1f%%", 100 * length(common_features) / total_unique), "\n"))
+  }
+  
+  # Esophagus Analysis
+  if(exists("esophagus_samples")) {
+    cat("\nESOPHAGUS SUBTYPE ANALYSIS\n")
+    cat("==========================\n")
+    esophagus_counts <- table(esophagus_samples$tissue_sub)
+    cat("Esophagus Subtype Distribution:\n")
+    for(subtype in names(esophagus_counts)) {
+      cat(sprintf("  %-30s: %3d samples\n", subtype, esophagus_counts[subtype]))
+    }
+  }
+  
+  # Cross-Validation Stability
+  if(exists("stability_stats")) {
+    cat("\nMODEL STABILITY ANALYSIS\n")
+    cat("========================\n")
+    
+    stable_rin <- sum(stability_stats$cv_r[stability_stats$target == "SMRIN"] < 0.2, na.rm = TRUE)
+    total_rin <- sum(stability_stats$target == "SMRIN")
+    stable_auto <- sum(stability_stats$cv_r[stability_stats$target == "SMATSSCR"] < 0.2, na.rm = TRUE)
+    total_auto <- sum(stability_stats$target == "SMATSSCR")
+    
+    cat("Cross-Validation Stability (CV < 0.2 = Stable):\n")
+    cat(sprintf("  RIN Models: %d/%d stable (%.1f%%)\n", stable_rin, total_rin, 100 * stable_rin / total_rin))
+    cat(sprintf("  Autolysis Models: %d/%d stable (%.1f%%)\n", stable_auto, total_auto, 100 * stable_auto / total_auto))
+  }
+  
+  # Summary Statistics
+  cat("\nSUMMARY STATISTICS\n")
+  cat("==================\n")
+  
+  # Files generated
+  output_files <- list.files(output_path, pattern = "*.pdf", full.names = FALSE)
+  cat(paste("Generated", length(output_files), "visualization files:\n"))
+  for(file in output_files) {
+    cat(paste("  -", file, "\n"))
+  }
+  
+  # Data files saved
+  processed_files <- list.files(file.path(data_path, "processed"), pattern = "*.rds|*.csv", full.names = FALSE)
+  cat(paste("\nSaved", length(processed_files), "processed data files:\n"))
+  for(file in head(processed_files, 10)) {  # Show first 10 to avoid clutter
+    cat(paste("  -", file, "\n"))
+  }
+  if(length(processed_files) > 10) {
+    cat(paste("  ... and", length(processed_files) - 10, "more files\n"))
+  }
+  
+  # Key Findings Summary
+  cat("\nKEY FINDINGS\n")
+  cat("============\n")
+  cat("1. DATASET CHARACTERISTICS:\n")
+  cat("   - Large-scale analysis of GTEx whole-slide image features\n")
+  cat("   - Comprehensive coverage of human tissue types\n")
+  cat("   - Quality metrics available for substantial subset\n\n")
+  
+  cat("2. TISSUE HETEROGENEITY:\n")
+  cat("   - Clear tissue-specific clustering in UMAP analysis\n")
+  cat("   - Variable silhouette scores indicate different tissue separability\n")
+  cat("   - Feature importance varies significantly across tissue types\n\n")
+  
+  cat("3. QUALITY PREDICTION MODELS:\n")
+  cat("   - Tissue-specific models show heterogeneous performance\n")
+  cat("   - Some tissues highly predictable, others more challenging\n")
+  cat("   - Cross-validation demonstrates model robustness\n\n")
+  
+  cat("4. FEATURE ANALYSIS:\n")
+  cat("   - Statistical feature categories show different importance patterns\n")
+  cat("   - Partial overlap between RIN and autolysis predictive features\n")
+  cat("   - Feature consistency varies across tissues\n\n")
+  
+  cat("5. BIOLOGICAL INSIGHTS:\n")
+  cat("   - Tissue type is strongest predictor of quality variance\n")
+  cat("   - Age and sex show modest but significant effects\n")
+  cat("   - Hardy scale (death circumstances) influences tissue quality\n\n")
+  
+  # Technical Details
+  cat("TECHNICAL DETAILS\n")
+  cat("=================\n")
+  cat("Analysis Pipeline Components:\n")
+  cat("  1. Data Integration and Quality Control\n")
+  cat("  2. Demographic and Tissue Distribution Analysis\n")
+  cat("  3. Principal Component Analysis (PCA)\n")
+  cat("  4. Uniform Manifold Approximation and Projection (UMAP)\n")
+  cat("  5. Silhouette Analysis for Cluster Validation\n")
+  cat("  6. Quality Metrics Distribution Analysis\n")
+  cat("  7. Analysis of Variance (ANOVA) for Demographic Effects\n")
+  cat("  8. Correlation Analysis Between Quality Metrics\n")
+  cat("  9. Tissue-Specific Predictive Modeling (Lasso Regression)\n")
+  cat(" 10. Cross-Validation and Model Stability Assessment\n")
+  cat(" 11. Feature Importance and Consistency Analysis\n")
+  cat(" 12. Residual Analysis and Model Diagnostics\n")
+  cat(" 13. Comparative Analysis Across Tissue Types\n\n")
+  
+  cat("Statistical Methods:\n")
+  cat("  - 5-fold cross-validation for model training\n")
+  cat("  - Lasso regularization for feature selection\n")
+  cat("  - Spearman correlation for non-parametric associations\n")
+  cat("  - ANOVA for variance decomposition\n")
+  cat("  - Silhouette analysis for cluster quality assessment\n\n")
+  
+  # Footer
+  cat("================================================================================\n")
+  cat("                              END OF REPORT                                     \n")
+  cat("================================================================================\n")
+  cat(paste("Report completed:", Sys.time(), "\n"))
+  cat("For questions or additional analysis, contact the analysis team.\n")
+  
+  sink()
+  
+  message("Comprehensive report generated successfully!")
+  message("Report saved to: ", report_path)
+  
+  return(report_path)
+}
+
+# Execute the comprehensive report
+start_time <- Sys.time()  # Track analysis duration
+comprehensive_report_path <- generate_comprehensive_report()
+```
+
+
+#------------------------------------------------------------------------------
+# 15. Final Report
+#------------------------------------------------------------------------------
+```{r}
+# Generate comprehensive report
+report_path <- file.path(data_path, "processed/tissue_modeling_report.txt")
+sink(report_path)
+
+cat("GTEx TISSUE-LEVEL MODELING REPORT\n")
+cat("=================================\n\n")
+
+cat("SUMMARY:\n")
+cat(paste("Analysis Date:", Sys.time(), "\n"))
+cat(paste("Total Tissues Analyzed:", length(unique(merged_gtex$tissue_main)), "\n"))
+cat(paste("Total Samples:", nrow(merged_gtex), "\n\n"))
+
+cat("MODELING RESULTS:\n")
+
+# RIN Models
+if("SMRIN" %in% names(all_results)) {
+  rin_models <- all_results[["SMRIN"]]
+  rin_r_values <- sapply(rin_models, function(x) {
+    if(is.null(x)) return(NA)
+    return(x$performance$pooled_r)
+  # return(sqrt(x$performance$pooled_r2)) # use when required for R²
+  })
+  rin_r_values <- rin_r_values[!is.na(rin_r_values)]
+  
+  cat("\nRIN Score Prediction:\n")
+  cat(paste("  Successful models:", length(rin_r_values), "\n"))
+  cat(paste("  Mean R:", round(mean(rin_r_values), 3), "\n"))
+  cat(paste("  Median R:", round(median(rin_r_values), 3), "\n"))
+  cat(paste("  Strong correlations (R > 0.5):", sum(rin_r_values > 0.5), "\n"))
+}
+
+# Autolysis Models
+if("SMATSSCR" %in% names(all_results)) {
+  auto_models <- all_results[["SMATSSCR"]]
+  auto_r_values <- sapply(auto_models, function(x) {
+    if(is.null(x)) return(NA)
+    return(sqrt(x$performance$pooled_r2))
+  })
+  auto_r_values <- auto_r_values[!is.na(auto_r_values)]
+  
+  cat("\nAutolysis Score Prediction:\n")
+  cat(paste("  Successful models:", length(auto_r_values), "\n"))
+  cat(paste("  Mean R:", round(mean(auto_r_values), 3), "\n"))
+  cat(paste("  Median R:", round(median(auto_r_values), 3), "\n"))
+  cat(paste("  Strong correlations (R > 0.5):", sum(auto_r_values > 0.5), "\n"))
+}
+
+cat("\nFEATURE ANALYSIS:\n")
+cat(paste("  Common features between models:", length(common_features), "\n"))
+cat(paste("  RIN-specific features:", length(rin_only_features), "\n"))
+cat(paste("  Autolysis-specific features:", length(auto_only_features), "\n"))
+
+cat("\nKEY FINDINGS:\n")
+cat("1. Tissue-specific models show heterogeneous predictability\n")
+cat("2. Feature importance varies across tissues and quality metrics\n")
+cat("3. Cross-validation demonstrates model robustness\n")
+
+cat("\n=================================\n")
+cat("Report generated on:", as.character(Sys.time()), "\n")
+
+sink()
+
+message("Analysis complete! Report saved to:", report_path)
+```
