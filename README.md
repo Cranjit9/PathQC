@@ -25,12 +25,12 @@ This pipeline analyzes GTEx (Genotype-Tissue Expression) whole-slide histologica
 
 ### Analysis Pipeline
 1. **Feature Processing**: Standardization and quality filtering of image-derived features
-2. **Exploratory Analysis**: Tissue distribution, quality score patterns, demographic effects
+2. **Exploratory Analysis**: Tissue distribution, quality score patterns, demographic effects (Pipeline)
 3. **Dimensionality Reduction**: PCA and UMAP for tissue clustering visualization
-4. **Predictive Modeling**: Tissue-specific Lasso regression with cross-validation
+4. **Predictive Modeling**: Tissue-specific Lasso regression with cross-validation (lasso)
 5. **Model Evaluation**: Performance assessment, stability analysis, feature importance
 
-### Key Innovations
+### Key Features
 - **Tissue-specific models**: Individual predictive models for each tissue type
 - **Feature selection**: Correlation-based selection of top 5% most predictive features
 - **Cross-validation**: 5-fold CV ensures robust performance estimates
@@ -76,7 +76,6 @@ source("gtex_tissue_modeling.R")
 
 ### System Requirements
 - **R**: Version 4.0 or higher
-- **Memory**: 8GB RAM minimum, 16GB recommended
 - **Runtime**: 1-2 hours for complete analysis
 - **Dependencies**: See installation section
 
@@ -101,12 +100,6 @@ source("gtex_tissue_modeling.R")
 
 ## Contributing
 
-We welcome contributions! Please see our contributing guidelines for:
-- Code style requirements
-- Testing procedures
-- Documentation standards
-- Issue reporting
-
----
+We welcome contributions! 
 
 **Note**: This pipeline is designed for research purposes. Ensure compliance with GTEx data use agreements and institutional policies.
