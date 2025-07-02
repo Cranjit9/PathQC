@@ -316,6 +316,43 @@ autolysis_summary <- create_performance_summary(all_results[["SMATSSCR"]], "Auto
 write.csv(rin_summary, file.path(results_path, "rin_model_summary.csv"), row.names = FALSE)
 write.csv(autolysis_summary, file.path(results_path, "autolysis_model_summary.csv"), row.names = FALSE)
 
+# Calculate average correlation coefficients
+average_rin_correlation <- round(mean(abs(rin_summary$R), na.rm = TRUE), 3)
+average_autolysis_correlation <- round(mean(abs(autolysis_summary$R), na.rm = TRUE), 3)
+
+# Identify best performing tissues
+best_rin_tissue <- rin_summary$Tissue[1]  # First row after sorting by R
+best_rin_correlation <- round(abs(rin_summary$R[1]), 3)
+
+best_autolysis_tissue <- autolysis_summary$Tissue[1]
+best_autolysis_correlation <- round(abs(autolysis_summary$R[1]), 3)
+
+# Print results for abstract
+cat("\n=== ABSTRACT STATISTICS ===\n")
+cat("Average RIN correlation coefficient:", average_rin_correlation, "\n")
+cat("Average Autolysis correlation coefficient:", average_autolysis_correlation, "\n")
+cat("Best RIN tissue:", best_rin_tissue, "with R =", best_rin_correlation, "\n")
+cat("Best Autolysis tissue:", best_autolysis_tissue, "with R =", best_autolysis_correlation, "\n")
+
+# Save for easy reference
+abstract_stats <- list(
+  avg_rin_r = average_rin_correlation,
+  avg_auto_r = average_autolysis_correlation,
+  best_rin_tissue = best_rin_tissue,
+  best_rin_r = best_rin_correlation,
+  best_auto_tissue = best_autolysis_tissue,
+  best_auto_r = best_autolysis_correlation
+)
+
+saveRDS(abstract_stats, file.path(output_path, "abstract_statistics.rds"))
+write.csv(data.frame(
+  Metric = c("Average RIN R", "Average Autolysis R", "Best RIN Tissue", "Best RIN R", 
+             "Best Autolysis Tissue", "Best Autolysis R"),
+  Value = c(average_rin_correlation, average_autolysis_correlation, 
+            best_rin_tissue, best_rin_correlation, 
+            best_autolysis_tissue, best_autolysis_correlation)
+), file.path(output_path, "abstract_statistics.csv"), row.names = FALSE)
+
 # Create comparison
 model_comparison <- merge(
   rin_summary[, c("Tissue", "R")],
@@ -338,8 +375,188 @@ model_comparison$Better_Model <- ifelse(abs(model_comparison$R_RIN) > abs(model_
 write.csv(model_comparison, file.path(results_path, "model_comparison.csv"), row.names = FALSE)
 ```
 
+#-------------------------------------------------------
+# 5.Subtype-Level LASSO Modeling 
+# 5.1 Subtype-Level for Esophagus
+#-------------------------------------------------------
+```{r}
+target <- "SMRIN"
+tissue_name <- "Esophagus"
+subtype_data <- merged_gtex[tissue_main == tissue_name]
+subtypes <- unique(subtype_data$tissue_sub)
+
+lasso_results <- list()
+
+for(subtype in subtypes) {
+  data_sub <- subtype_data[tissue_sub == subtype]
+  data_sub <- data_sub[!is.na(data_sub[[target]])]
+  
+  if(nrow(data_sub) < 10) {
+    message(paste("Skipping", subtype, "- not enough samples"))
+    next
+  }
+  
+  feature_cols <- grep("^feature_", names(data_sub), value = TRUE)
+  feature_vars <- apply(data_sub[, ..feature_cols], 2, var)
+  valid_features <- feature_cols[feature_vars > 1e-10]
+  
+  set.seed(123)
+  folds <- createFolds(data_sub[[target]], k = 5)
+  all_fold_preds <- data.frame()
+  fold_results <- list()
+  
+  for(i in seq_along(folds)) {
+    test_idx <- folds[[i]]
+    train_data <- data_sub[-test_idx]
+    test_data <- data_sub[test_idx]
+    
+    # Top 5% correlated features on training set
+    feature_corr <- sapply(valid_features, function(f) cor(train_data[[f]], train_data[[target]], use = "complete.obs"))
+    top_n <- max(1, ceiling(length(valid_features) * 0.05))
+    top_features <- names(sort(abs(feature_corr), decreasing = TRUE))[1:top_n]
+    
+    x_train <- scale(as.matrix(train_data[, ..top_features]))
+    y_train <- train_data[[target]]
+    
+    x_mean <- attr(x_train, "scaled:center")
+    x_sd <- attr(x_train, "scaled:scale")
+    
+    cv_fit <- cv.glmnet(x_train, y_train, alpha = 1)
+    best_lambda <- cv_fit$lambda.min
+    model <- glmnet(x_train, y_train, alpha = 1, lambda = best_lambda)
+    
+    x_test <- scale(as.matrix(test_data[, ..top_features]), center = x_mean, scale = x_sd)
+    preds <- predict(model, x_test, s = best_lambda)
+    
+    all_fold_preds <- rbind(all_fold_preds, data.frame(
+      fold = i,
+      actual = test_data[[target]],
+      predicted = as.numeric(preds)
+    ))
+    
+    fold_results[[i]] <- list(
+      fold = i,
+      rmse = sqrt(mean((preds - test_data[[target]])^2)),
+      r = cor(preds, test_data[[target]]),
+      r2 = cor(preds, test_data[[target]])^2,
+      mae = mean(abs(preds - test_data[[target]])),
+      lambda = best_lambda
+    )
+  }
+  
+  pooled_rmse <- sqrt(mean((all_fold_preds$predicted - all_fold_preds$actual)^2))
+  pooled_r <- cor(all_fold_preds$predicted, all_fold_preds$actual)
+  pooled_r2 <- pooled_r^2
+  pooled_mae <- mean(abs(all_fold_preds$predicted - all_fold_preds$actual))
+  
+  lasso_results[[subtype]] <- list(
+    subtype = subtype,
+    sample_size = nrow(data_sub),
+    pooled_rmse = pooled_rmse,
+    pooled_r = pooled_r,
+    pooled_r2 = pooled_r2,
+    pooled_mae = pooled_mae,
+    fold_results = fold_results,
+    all_fold_preds = all_fold_preds
+  )
+  
+  if (!is.na(pooled_r) && abs(pooled_r) > 0.5) {
+    p <- ggplot(all_fold_preds, aes(x = actual, y = predicted)) +
+      geom_point(alpha = 0.7, color = "darkgreen") +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+      geom_smooth(method = "lm", se = FALSE, color = "blue") +
+      labs(
+        title = paste("LASSO Prediction -", tissue_name, subtype),
+        subtitle = paste("R =", round(pooled_r, 3), "| RMSE =", round(pooled_rmse, 3)),
+        x = "Actual SMRIN", y = "Predicted SMRIN"
+      ) +
+      theme_minimal()
+    
+    ggsave(filename = file.path(output_path, paste0("lasso_", tissue_name, "_", subtype, "_scatter.pdf")),
+           plot = p, width = 8, height = 6, dpi = 300)
+  }
+}
+
+# Save overall LASSO results
+saveRDS(lasso_results, file.path(results_path, paste0("lasso_", tissue_name, "_subtypes_results.rds")))
+```
+
+#-----------------------------------------------------------
+# 5.2. Plot Faceted LASSO Predictions for Esophagus Subtypes
+#-----------------------------------------------------------
+```{r}
+# Combine all fold predictions with subtype label
+all_preds <- do.call(rbind, lapply(lasso_results, function(x) x$all_fold_preds))
+all_preds$Subtype <- rep(names(lasso_results), times = sapply(lasso_results, function(x) nrow(x$all_fold_preds)))
+
+all_preds$Subtype <- factor(all_preds$Subtype, levels = unique(all_preds$Subtype))
+
+facet_labels <- sapply(levels(all_preds$Subtype), function(subtype) {
+  df_sub <- subset(all_preds, Subtype == subtype)
+  r_val <- round(cor(df_sub$actual, df_sub$predicted), 3)
+  r_squared <- round(r_val^2, 3)
+  rmse_val <- round(sqrt(mean((df_sub$actual - df_sub$predicted)^2)), 3)
+  paste0(subtype, "\nR = ", r_val, ", RMSE = ", rmse_val, "\nR² = ", r_squared )
+})
+names(facet_labels) <- levels(all_preds$Subtype)
+
+facet_plot <- ggplot(all_preds, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  facet_wrap(~ Subtype, labeller = as_labeller(facet_labels)) +
+  labs(
+    title = paste("LASSO Prediction of", target, "for", tissue_name, "Subtypes"),
+    x = paste("Actual", target),
+    y = paste("Predicted", target)
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave(filename = file.path(output_path, paste0(tissue_name, "_LASSO_facet_SMIRN_labeled.pdf")),
+       plot = facet_plot, width = 12, height = 8, dpi = 300)
+
+```
+#---------------------------------------------------------------
+# 5.3. Aggregate Subtype Summaries Across All Tissues & Save CSV
+#---------------------------------------------------------------
+```{r}
+subtype_summary_list <- list()
+
+for(tissue in names(all_results[["SMRIN"]])) {
+  model_result <- all_results[["SMRIN"]][[tissue]]
+  preds <- model_result$all_predictions
+  if(is.null(preds)) next
+  
+  gtex_sub <- merged_gtex[tissue_main == tissue]
+  preds$Subtype <- gtex_sub[match(preds$sample_id, gtex_sub$sample_id), tissue_sub]
+  
+  if(length(unique(na.omit(preds$Subtype))) <= 1) next
+  
+  subtype_metrics <- preds %>%
+    group_by(Subtype) %>%
+    summarise(
+      Tissue = tissue,
+      Sample_Size = n(),
+      R = cor(predicted, actual),
+      R2 = cor(predicted, actual)^2,
+      RMSE = sqrt(mean((predicted - actual)^2)),
+      MAE = mean(abs(predicted - actual))
+    ) %>%
+    select(Tissue, Subtype, Sample_Size, R, R2, RMSE, MAE)
+  
+  subtype_summary_list[[tissue]] <- subtype_metrics
+}
+
+subtype_summary_df <- bind_rows(subtype_summary_list) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+write.csv(subtype_summary_df, file.path(output_path, "LASSO_subtype_model_summary.csv"), row.names = FALSE)
+
+print(subtype_summary_df)
+```
+
 #------------------------------------------------------------------------------
-# 5. Figure 3 - Model Performance Visualization
+# 6. Figure 3 - Model Performance Visualization
 #------------------------------------------------------------------------------
 ```{r}
 # Panel A & B: Performance bar plots
@@ -470,9 +687,22 @@ figure3_final <- grid.arrange(combined_barplots, combined_CD_plots, ncol = 2, wi
 ggsave(file.path(output_path, "Figure3_Final_Complete.pdf"), 
        figure3_final, width = 20, height = 12, dpi = 600, bg = "white")
 ```
+```{r}
+# Check your current merged_gtex data
+# Look for these specific tissues and their performance
+skin_rin <- all_results[["SMRIN"]][["Skin"]]$performance$pooled_r
+skin_auto <- all_results[["SMATSSCR"]][["Skin"]]$performance$pooled_r
+fallopian_rin <- all_results[["SMRIN"]][["Fallopian Tube"]]$performance$pooled_r
+fallopian_auto <- all_results[["SMATSSCR"]][["Fallopian Tube"]]$performance$pooled_r
+
+cat("Current analysis results:\n")
+cat(sprintf("Skin: RIN R = %.3f, Autolysis R = %.3f\n", abs(skin_rin), abs(skin_auto)))
+cat(sprintf("Fallopian Tube: RIN R = %.3f, Autolysis R = %.3f\n", abs(fallopian_rin), abs(fallopian_auto)))
+```
+
 
 #------------------------------------------------------------------------------
-# 6. Figure 4 - Feature Importance
+# 7. Figure 4 - Feature Importance
 #------------------------------------------------------------------------------
 ```{r}
 # Extract top features
@@ -574,9 +804,270 @@ ggsave(file.path(output_path, "Figure4_Feature.pdf"),
        figure4, width = 14, height = 12, dpi = 600, bg = "transparent")
 ```
 
+#------------------------------------------------------------------------------
+# 7.1 Fold Consistency Check
+#------------------------------------------------------------------------------
+```{r}
+# Calculate tissue-level fold consistency
+calculate_tissue_consistency <- function(all_results, target) {
+  tissue_consistency <- data.frame()
+  
+  for(tissue_name in names(all_results[[target]])) {
+    tissue_result <- all_results[[target]][[tissue_name]]
+    if(is.null(tissue_result) || is.null(tissue_result$feature_counts)) next
+    
+    # Get overall performance and calculate feature consistency
+    overall_r <- if(!is.null(tissue_result$performance$pooled_r)) abs(tissue_result$performance$pooled_r) else NA
+    if(is.na(overall_r)) next
+    
+    feature_counts <- tissue_result$feature_counts
+    if(length(feature_counts) == 0) next
+    
+    consistency_percentages <- (as.numeric(feature_counts) / 5) * 100  # 5-fold CV
+    mean_consistency <- mean(consistency_percentages)
+    
+    tissue_consistency <- rbind(tissue_consistency, data.frame(
+      tissue = tissue_name, overall_r = overall_r, mean_consistency = mean_consistency, stringsAsFactors = FALSE
+    ))
+  }
+  return(tissue_consistency)
+}
+
+# Calculate for both targets and combine
+rin_consistency <- calculate_tissue_consistency(all_results, "SMRIN")
+auto_consistency <- calculate_tissue_consistency(all_results, "SMATSSCR")
+combined_consistency <- rbind(cbind(rin_consistency, target = "SMRIN"), cbind(auto_consistency, target = "SMATSSCR"))
+
+# Define performance categories and print summary
+combined_consistency$category <- ifelse(combined_consistency$overall_r >= 0.6, "High-performing", "Poor-performing")
+high_perf <- combined_consistency[combined_consistency$category == "High-performing", ]
+poor_perf <- combined_consistency[combined_consistency$category == "Poor-performing", ]
+
+if(nrow(high_perf) > 0 && nrow(poor_perf) > 0) {
+  cat(sprintf("Fold Consistency: High = %.1f%%, Poor = %.1f%%\n", 
+              mean(high_perf$mean_consistency, na.rm = TRUE), 
+              mean(poor_perf$mean_consistency, na.rm = TRUE)))
+}
+
+# Top 5 and bottom 5 by consistency
+top_5 <- head(combined_consistency[order(-combined_consistency$mean_consistency), ], 5)
+bottom_5 <- head(combined_consistency[order(combined_consistency$mean_consistency), ], 5)
+
+cat("Top 5:", paste(sprintf("%s(%.1f%%)", top_5$tissue, top_5$mean_consistency), collapse = ", "), "\n")
+cat("Bottom 5:", paste(sprintf("%s(%.1f%%)", bottom_5$tissue, bottom_5$mean_consistency), collapse = ", "), "\n")
+
+```
 
 #------------------------------------------------------------------------------
-# 7. Additional Visualizations and Comparative Analysis
+# Feature Consistency Analysis Figure
+#------------------------------------------------------------------------------
+
+```{r}
+# Create Clean Feature Consistency Visualization
+create_feature_consistency_figure_clean <- function(combined_consistency) {
+
+  # Convert target values to proper labels for consistent mapping
+  combined_consistency_labeled <- combined_consistency %>%
+    mutate(target_label = case_when(
+      target == "SMRIN" ~ "RIN",
+      target == "SMATSSCR" ~ "Autolysis",
+      TRUE ~ target
+    ))
+
+  # Calculate overall statistics (matching console output)
+  overall_stats <- combined_consistency_labeled %>%
+    group_by(category) %>%
+    summarise(
+      mean_consistency = mean(mean_consistency, na.rm = TRUE),
+      se_consistency = sd(mean_consistency, na.rm = TRUE) / sqrt(n()),
+      n_tissues = n(),
+      .groups = 'drop'
+    )
+
+  # Panel A: Combined box plot matching console output
+  panel_a <- ggplot(combined_consistency_labeled, aes(x = category, y = mean_consistency)) +
+    geom_boxplot(alpha = 0.8, outlier.alpha = 0.6, fill = "steelblue") +
+    geom_point(aes(color = target_label), position = position_jitter(width = 0.2), 
+               alpha = 0.7, size = 2.5) +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 5, 
+                 fill = "white", stroke = 2, color = "black") +
+    geom_text(data = overall_stats, 
+              aes(x = category, y = mean_consistency + 5, 
+                  label = paste0(round(mean_consistency, 1), "%")),
+              size = 5, fontface = "bold", color = "black") +
+    scale_color_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+    labs(
+      title = "A. Feature Consistency: High vs Poor Performing Models",
+      x = "Model Performance Category",
+      y = "Mean Feature Consistency (%)",
+      color = "Model Type"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      legend.position = "top",
+      axis.title = element_text(size = 12, face = "bold"),
+      axis.text = element_text(size = 11)
+    ) +
+    ylim(0, 100)
+
+  # Panel B: Scatter plot showing relationship
+  panel_b <- ggplot(combined_consistency, aes(x = overall_r, y = mean_consistency, color = target)) +
+    geom_point(size = 3, alpha = 0.8) +
+    geom_smooth(method = "lm", se = TRUE, alpha = 0.3) +
+    geom_vline(xintercept = 0.6, linetype = "dashed", color = "gray50", size = 1) +
+    annotate("text", x = 0.62, y = 95, label = "High Performance\nThreshold (R ≥ 0.6)", 
+             hjust = 0, size = 3.5, color = "gray30") +
+    scale_color_manual(values = c("SMRIN" = "#66CDAA", "SMATSSCR" = "#FC8D62"),
+                      labels = c("RIN", "Autolysis")) +
+    labs(
+      title = "B. Model Performance vs Feature Consistency",
+      x = "Model Performance (|R|)",
+      y = "Mean Feature Consistency (%)"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      legend.position = "none",
+      axis.title = element_text(size = 12, face = "bold"),
+      axis.text = element_text(size = 11)
+    ) +
+    ylim(0, 100)
+
+  # Panel C: Clean bar chart with overall values
+  panel_c <- ggplot(overall_stats, aes(x = category, y = mean_consistency)) +
+    geom_bar(stat = "identity", alpha = 0.8, width = 0.6, fill = "steelblue") +
+    geom_errorbar(aes(ymin = mean_consistency - se_consistency, 
+                      ymax = mean_consistency + se_consistency),
+                  width = 0.25) +
+    geom_text(aes(label = paste0(round(mean_consistency, 1), "%")), 
+              vjust = -0.5, size = 6, fontface = "bold") +
+    geom_text(aes(label = paste0("n=", n_tissues)), 
+              vjust = -2.5, size = 4, color = "gray50") +
+    labs(
+      title = "C. Overall Feature Consistency by Performance Category",
+      x = "Model Performance Category", 
+      y = "Mean Feature Consistency (%) ± SE"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      axis.title = element_text(size = 12, face = "bold"),
+      axis.text = element_text(size = 11)
+    ) +
+    ylim(0, 100)
+
+  # Panel D: Top 6 and Bottom 6 models
+  top_6 <- combined_consistency %>%
+    arrange(desc(mean_consistency)) %>%
+    slice(1:6) %>%
+    mutate(
+      tissue_label = paste0(tissue, " (", target, ")"),
+      rank_type = "Top 6 Most Consistent"
+    )
+
+  bottom_6 <- combined_consistency %>%
+    arrange(mean_consistency) %>%
+    slice(1:6) %>%
+    mutate(
+      tissue_label = paste0(tissue, " (", target, ")"),
+      rank_type = "Bottom 6 Least Consistent"
+    )
+
+  combined_ranks <- rbind(top_6, bottom_6) %>%
+    mutate(
+      rank_type = factor(rank_type, levels = c("Top 6 Most Consistent", "Bottom 6 Least Consistent")),
+      tissue_label = factor(tissue_label, levels = tissue_label[order(mean_consistency)]),
+      target_label = case_when(
+        target == "SMRIN" ~ "RIN",
+        target == "SMATSSCR" ~ "Autolysis",
+        TRUE ~ target
+      )
+    )
+
+  panel_d <- ggplot(combined_ranks, aes(x = tissue_label, y = mean_consistency, fill = target_label)) +
+    geom_bar(stat = "identity", alpha = 0.8) +
+    geom_text(aes(label = paste0(round(mean_consistency, 1), "%")), 
+              hjust = -0.1, size = 3.5, fontface = "bold") +
+    coord_flip() +
+    facet_wrap(~rank_type, scales = "free_y", ncol = 1) +
+    scale_fill_manual(values = c("RIN" = "#66CDAA", "Autolysis" = "#FC8D62")) +
+    labs(
+      title = "D. Most and Least Consistent Models",
+      x = "Tissue (Model Type)",
+      y = "Feature Consistency (%)",
+      fill = "Model Type"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      legend.position = "bottom",
+      axis.title = element_text(size = 12, face = "bold"),
+      axis.text = element_text(size = 10),
+      strip.text = element_text(size = 12, face = "bold")
+    ) +
+    ylim(0, 100)
+
+  # Combine all panels
+  top_row <- plot_grid(panel_a, panel_b, ncol = 2, rel_widths = c(1, 1))
+  bottom_row <- plot_grid(panel_c, panel_d, ncol = 2, rel_widths = c(1, 1.2))
+
+  final_figure <- plot_grid(top_row, bottom_row, nrow = 2, rel_heights = c(1, 1))
+
+  return(final_figure)
+}
+
+# Execute the function and save the figure
+feature_consistency_figure_clean <- create_feature_consistency_figure_clean(combined_consistency)
+
+# Save the figure
+ggsave(file.path(output_path, "Figure_S_FeatureConsistency_Clean.pdf"), 
+       feature_consistency_figure_clean, 
+       width = 16, height = 12, dpi = 600, bg = "white")
+
+# Print consistency verification
+high_perf_mean <- mean(combined_consistency$mean_consistency[combined_consistency$category == "High-performing"], na.rm = TRUE)
+poor_perf_mean <- mean(combined_consistency$mean_consistency[combined_consistency$category == "Poor-performing"], na.rm = TRUE)
+
+cat("\n=== FIGURE VALUES ===\n")
+cat(sprintf("High-performing: %.1f%%\n", high_perf_mean))
+cat(sprintf("Poor-performing: %.1f%%\n", poor_perf_mean))
+cat(sprintf("Difference: %.1f percentage points\n", high_perf_mean - poor_perf_mean))
+
+print("Clean feature consistency figure created successfully!")
+
+
+```
+
+# Additional analysis for detailed breakdown
+```{r}
+# Create supplementary analysis for different consistency thresholds
+analyze_consistency_thresholds <- function(combined_consistency) {
+  
+  # Define consistency categories
+  combined_consistency$consistency_category <- cut(
+    combined_consistency$mean_consistency,
+    breaks = c(0, 40, 60, 80, 100),
+    labels = c("Low (0-40%)", "Moderate (40-60%)", "High (60-80%)", "Very High (80-100%)")
+  )
+  
+  # Create cross-tabulation
+  consistency_crosstab <- table(combined_consistency$category, 
+                               combined_consistency$consistency_category)
+  
+  # Convert to proportions
+  consistency_props <- prop.table(consistency_crosstab, margin = 1) * 100
+  
+  return(list(crosstab = consistency_crosstab, proportions = consistency_props))
+}
+
+consistency_analysis <- analyze_consistency_thresholds(combined_consistency)
+print("Consistency threshold analysis:")
+print(consistency_analysis$proportions)
+```
+
+#------------------------------------------------------------------------------
+# 8. Additional Visualizations and Comparative Analysis
 #------------------------------------------------------------------------------
 ```{r}
 # Create comparative performance chart for top tissues
@@ -690,7 +1181,7 @@ create_enhanced_scatter_plots <- function(results, target_name, top_n = 6) {
         axis.title = element_text(size = 11, face = "bold")
       )
     
-    ggsave(file.path(output_path, paste0("enhanced_", tissue, "_", gsub(" ", "_", tolower(target_name)), "_scatter.pdf")), 
+    ggsave(file.path(output_path, paste0("comparative_", tissue, "_", gsub(" ", "_", tolower(target_name)), "_scatter.pdf")), 
            scatter_plot, width = 10, height = 8, dpi = 300)
   }
 }
@@ -706,7 +1197,7 @@ create_enhanced_scatter_plots(all_results[["SMATSSCR"]], "Autolysis Score", top_
 
 
 #------------------------------------------------------------------------------
-# 8. Figure 5: Model Performance vs Sample Size Analysis
+# 9. Figure 5: Model Performance vs Sample Size Analysis
 #------------------------------------------------------------------------------
 ```{r}
 create_sample_size_analysis <- function(rin_summary, autolysis_summary) {
@@ -808,7 +1299,7 @@ ggsave(file.path(output_path, "Figure5_Sample_Size_Analysis.pdf"),
 ```
 
 #------------------------------------------------------------------------------
-# 9. Top 5 Tissues Quality Overlay
+# 10. Top 5 Tissues Quality Overlay
 #------------------------------------------------------------------------------
 ```{r}
 # Get top 5 tissues for each score
@@ -907,7 +1398,7 @@ ggsave(file.path(output_path, "Top5_Tissues_Quality_Overlay_AB.pdf"),
 ```
 
 #------------------------------------------------------------------------------
-# 10. Figure 6: Cross-Tissue Feature Consistency Analysis
+# 11. Figure 6: Cross-Tissue Feature Consistency Analysis
 #------------------------------------------------------------------------------
 ```{r}
 create_feature_consistency_analysis <- function(all_results) {
@@ -1056,7 +1547,7 @@ ggsave(file.path(output_path, "Figure6_Feature_Consistency.pdf"),
 ```
 
 #------------------------------------------------------------------------------
-# 11. Figure 7: Model Residual Analysis
+# 12. Figure 7: Model Residual Analysis
 #------------------------------------------------------------------------------
 ```{r}
 create_comprehensive_residual_analysis <- function(all_results, top_n = 6) {
@@ -1241,7 +1732,7 @@ ggsave(file.path(output_path, "Figure7_Residual_Analysis.pdf"),
 ```
 
 #------------------------------------------------------------------------------
-# 11. Figure 8: Biological Feature Interpretation
+# 13. Figure 8: Biological Feature Interpretation
 #------------------------------------------------------------------------------
 ```{r}
 create_biological_interpretation_analysis <- function(all_results, merged_gtex) {
@@ -1484,7 +1975,7 @@ ggsave(file.path(output_path, "Figure8_Biological_Interpretation.pdf"),
 ```
 
 #------------------------------------------------------------------------------
-# 12. Supplementary Figure S1: Quality Score Distributions by Tissue
+# 14. Supplementary Figure S1: Quality Score Distributions by Tissue
 #------------------------------------------------------------------------------
 ```{r}
 create_quality_score_distributions <- function(merged_gtex) {
@@ -1608,7 +2099,7 @@ ggsave(file.path(output_path, "SuppFig_S1_Quality_Distributions.pdf"),
 ```
 
 #------------------------------------------------------------------------------
-# 13. Supplementary Figure S2: Cross-validation Stability Analysis
+# 15. Supplementary Figure S2: Cross-validation Stability Analysis
 #------------------------------------------------------------------------------
 ```{r}
 create_cv_stability_analysis <- function(all_results) {
@@ -1811,9 +2302,106 @@ ggsave(file.path(output_path, "SuppFig_S2_CV_Stability.pdf"),
        supp_figure_s2, width = 14, height = 12, dpi = 600, bg = "white")
 ```
 
+#------------------------------------------------------------------------------
+# 15.1 CV Stability Analysis
+#------------------------------------------------------------------------------
+```{r}
+calculate_stability_stats <- function(all_results, merged_gtex) {
+  stability_summary <- data.frame()
+  
+  for(target in c("SMRIN", "SMATSSCR")) {
+    for(tissue in names(all_results[[target]])) {
+      result <- all_results[[target]][[tissue]]
+      if(!is.null(result) && !is.null(result$fold_results)) {
+        
+        fold_r_values <- sapply(result$fold_results, function(x) abs(x$r))
+        
+        # Get training sample size (samples used for modeling)
+        training_sample_size <- if(!is.null(result$sample_size)) {
+          result$sample_size
+        } else {
+          if(!is.null(result$all_predictions)) {
+            nrow(result$all_predictions)
+          } else {
+            NA
+          }
+        }
+        
+        # Get total samples for this tissue (all samples regardless of quality metrics)
+        total_tissue_samples <- nrow(merged_gtex[tissue_main == tissue])
+        
+        # Get samples with this specific quality metric available
+        if(target == "SMRIN") {
+          samples_with_metric <- nrow(merged_gtex[tissue_main == tissue & !is.na(SMRIN)])
+        } else {
+          samples_with_metric <- nrow(merged_gtex[tissue_main == tissue & !is.na(SMATSSCR)])
+        }
+        
+        stability_row <- data.frame(
+          tissue = tissue,
+          target = target,
+          total_samples = total_tissue_samples,
+          samples_with_metric = samples_with_metric,
+          training_samples = training_sample_size,
+          mean_r = mean(fold_r_values),
+          cv_r = sd(fold_r_values) / mean(fold_r_values),
+          min_r = min(fold_r_values),
+          max_r = max(fold_r_values)
+        )
+        stability_summary <- rbind(stability_summary, stability_row)
+      }
+    }
+  }
+  
+  # Add performance categories
+  stability_summary$performance_cat <- ifelse(stability_summary$mean_r >= 0.6, "High-performing",
+                                             ifelse(stability_summary$mean_r >= 0.4, "Moderate-performing", "Poor-performing"))
+  
+  # Create tissue category objects
+  high_perf_tissues <- stability_summary[stability_summary$performance_cat == "High-performing", ]
+  moderate_perf_tissues <- stability_summary[stability_summary$performance_cat == "Moderate-performing", ]
+  poor_perf_tissues <- stability_summary[stability_summary$performance_cat == "Poor-performing", ]
+  
+  # Calculate CV averages
+  high_cv <- mean(high_perf_tissues$cv_r, na.rm = TRUE)
+  moderate_cv <- mean(moderate_perf_tissues$cv_r, na.rm = TRUE)
+  poor_cv <- mean(poor_perf_tissues$cv_r, na.rm = TRUE)
+  
+  # Save to CSV files
+  cv_stability_path <- "~/Desktop/PathQC/docs/"
+  write.csv(high_perf_tissues, file.path(cv_stability_path, "high_performing_tissues.csv"), row.names = FALSE)
+  write.csv(moderate_perf_tissues, file.path(cv_stability_path, "moderate_performing_tissues.csv"), row.names = FALSE)
+  write.csv(poor_perf_tissues, file.path(cv_stability_path, "poor_performing_tissues.csv"), row.names = FALSE)
+  write.csv(stability_summary, file.path(cv_stability_path, "all_tissue_stability.csv"), row.names = FALSE)
+  
+  # Print only essential results with all sample info
+  print(high_perf_tissues[, c("tissue", "target", "total_samples", "samples_with_metric", "training_samples", "mean_r", "cv_r")])
+  print(moderate_perf_tissues[, c("tissue", "target", "total_samples", "samples_with_metric", "training_samples", "mean_r", "cv_r")])
+  print(poor_perf_tissues[, c("tissue", "target", "total_samples", "samples_with_metric", "training_samples", "mean_r", "cv_r")])
+  
+  # Return all objects
+  return(list(
+    stability_summary = stability_summary,
+    high_perf_tissues = high_perf_tissues,
+    moderate_perf_tissues = moderate_perf_tissues,
+    poor_perf_tissues = poor_perf_tissues,
+    cv_values = c(high = high_cv, moderate = moderate_cv, poor = poor_cv)
+  ))
+}
+
+# Run the analysis (now requires merged_gtex parameter)
+stability_results <- calculate_stability_stats(all_results, merged_gtex)
+
+# Extract objects for individual access
+high_perf_tissues <- stability_results$high_perf_tissues
+moderate_perf_tissues <- stability_results$moderate_perf_tissues  
+poor_perf_tissues <- stability_results$poor_perf_tissues
+cv_values <- stability_results$cv_values
+
+```
 
 #------------------------------------------------------------------------------
-# 14. Supplementary Figure S3: Extended Comparative Analysis
+# 16. Supplementary Figure S3: Extended Comparative Analysis
 #------------------------------------------------------------------------------
 ```{r}
 create_extended_comparative_analysis <- function(all_results, rin_summary, autolysis_summary) {
@@ -2037,7 +2625,7 @@ ggsave(file.path(output_path, "SuppFig_S3_Extended_Comparison.pdf"),
 ```
 
 #------------------------------------------------------------------------------
-# 15. Comprehensive Final Report Generation
+# 17. Comprehensive Final Report Generation
 #------------------------------------------------------------------------------
 ```{r}
 generate_comprehensive_report <- function() {
@@ -2367,71 +2955,3 @@ comprehensive_report_path <- generate_comprehensive_report()
 ```
 
 
-#------------------------------------------------------------------------------
-# 15. Final Report
-#------------------------------------------------------------------------------
-```{r}
-# Generate comprehensive report
-report_path <- file.path(data_path, "processed/tissue_modeling_report.txt")
-sink(report_path)
-
-cat("GTEx TISSUE-LEVEL MODELING REPORT\n")
-cat("=================================\n\n")
-
-cat("SUMMARY:\n")
-cat(paste("Analysis Date:", Sys.time(), "\n"))
-cat(paste("Total Tissues Analyzed:", length(unique(merged_gtex$tissue_main)), "\n"))
-cat(paste("Total Samples:", nrow(merged_gtex), "\n\n"))
-
-cat("MODELING RESULTS:\n")
-
-# RIN Models
-if("SMRIN" %in% names(all_results)) {
-  rin_models <- all_results[["SMRIN"]]
-  rin_r_values <- sapply(rin_models, function(x) {
-    if(is.null(x)) return(NA)
-    return(x$performance$pooled_r)
-  # return(sqrt(x$performance$pooled_r2)) # use when required for R²
-  })
-  rin_r_values <- rin_r_values[!is.na(rin_r_values)]
-  
-  cat("\nRIN Score Prediction:\n")
-  cat(paste("  Successful models:", length(rin_r_values), "\n"))
-  cat(paste("  Mean R:", round(mean(rin_r_values), 3), "\n"))
-  cat(paste("  Median R:", round(median(rin_r_values), 3), "\n"))
-  cat(paste("  Strong correlations (R > 0.5):", sum(rin_r_values > 0.5), "\n"))
-}
-
-# Autolysis Models
-if("SMATSSCR" %in% names(all_results)) {
-  auto_models <- all_results[["SMATSSCR"]]
-  auto_r_values <- sapply(auto_models, function(x) {
-    if(is.null(x)) return(NA)
-    return(sqrt(x$performance$pooled_r2))
-  })
-  auto_r_values <- auto_r_values[!is.na(auto_r_values)]
-  
-  cat("\nAutolysis Score Prediction:\n")
-  cat(paste("  Successful models:", length(auto_r_values), "\n"))
-  cat(paste("  Mean R:", round(mean(auto_r_values), 3), "\n"))
-  cat(paste("  Median R:", round(median(auto_r_values), 3), "\n"))
-  cat(paste("  Strong correlations (R > 0.5):", sum(auto_r_values > 0.5), "\n"))
-}
-
-cat("\nFEATURE ANALYSIS:\n")
-cat(paste("  Common features between models:", length(common_features), "\n"))
-cat(paste("  RIN-specific features:", length(rin_only_features), "\n"))
-cat(paste("  Autolysis-specific features:", length(auto_only_features), "\n"))
-
-cat("\nKEY FINDINGS:\n")
-cat("1. Tissue-specific models show heterogeneous predictability\n")
-cat("2. Feature importance varies across tissues and quality metrics\n")
-cat("3. Cross-validation demonstrates model robustness\n")
-
-cat("\n=================================\n")
-cat("Report generated on:", as.character(Sys.time()), "\n")
-
-sink()
-
-message("Analysis complete! Report saved to:", report_path)
-```
