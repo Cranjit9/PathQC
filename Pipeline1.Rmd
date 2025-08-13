@@ -1,0 +1,1390 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#===============================================================================
+# GTEx Analysis Pipeline - Streamlined Version 
+# Purpose: Process and analyze GTEx data including image features and metadata 
+# Date: 2025-07-21
+#===============================================================================
+
+#------------------------------------------------------------------------------
+# 1. Setup and Configuration
+#------------------------------------------------------------------------------
+
+```{r}
+# Set paths
+base_dir <- "/Users/rsinha/Desktop/PathQC"
+data_path <- file.path(base_dir, "data")
+output_path <- file.path(base_dir, "output/figures")
+results_path <- file.path(data_path, "processed")
+h5_path <- file.path(data_path, "raw/GTEX_AGGREGATED/concatnated_features_pooled.h5")
+
+# Create directory structure
+dirs <- c(
+  "src/data", "src/features", "src/visualization", "src/models",
+  "data/raw/GTEX_AGGREGATED", "data/interim", "data/processed",
+  "docs/data_dictionary", "docs/pipeline",
+  "output/figures", "output/results",
+  "config", "logs"
+)
+
+for(dir in dirs) {
+  dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Initialize log
+log_file <- file.path("logs", paste0("gtex_pipeline_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".log"))
+write(paste("GTEx Pipeline Started:", Sys.time()), log_file)
+```
+
+#------------------------------------------------------------------------------
+# 2. Load Required Packages
+#------------------------------------------------------------------------------
+
+```{r}
+# Define and load required packages
+required_packages <- c(
+  "tidyverse", "stringr", "ggplot2", "corrplot", "umap", "factoextra",
+  "readxl", "data.table", "reticulate", "here", "logger", "uwot", "cluster", 
+  "ggrepel", "RColorBrewer", "magick", "geomtextpath", "grid", "gridExtra", 
+  "reshape2", "dplyr", "ggforce", "caret", "pROC", "patchwork", "glmnet", "vegan",
+  "cowplot"
+)
+
+# Install missing packages
+for(package in required_packages) {
+  if(!require(package, character.only = TRUE, quietly = TRUE)) {
+    install.packages(package)
+    library(package, character.only = TRUE)
+  }
+}
+# Install BiocManager packages
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+if (!requireNamespace("rhdf5", quietly = TRUE)) {
+  BiocManager::install("rhdf5")
+  library(rhdf5)
+}
+
+# Setup Python
+library(reticulate)
+use_python("/usr/bin/python3")
+np <- import("numpy")
+pd <- import("pandas")
+
+```
+
+#------------------------------------------------------------------------------
+# 3. Load and Process Data
+#------------------------------------------------------------------------------
+
+```{r}
+# Load metadata
+metadata_path <- file.path(data_path, "raw/metadata")
+
+# Load dictionaries and datasets
+dd_pheno <- read_xlsx(file.path(metadata_path,"GTEx_Analysis_v10_Annotations_SubjectPhenotypesDD.xlsx"))
+dd_attri <- read_xlsx(file.path(metadata_path, "GTEx_Analysis_v10_Annotations_SampleAttributesDD.xlsx"))
+ds_attri <- read.delim(file.path(metadata_path, "GTEx_Analysis_v10_Annotations_SampleAttributesDS.txt"))
+ds_pheno <- read.delim(file.path(metadata_path, "GTEx_Analysis_v10_Annotations_SubjectPhenotypesDS.txt"))
+
+# Load URL metadata
+url_meta <- read.csv(file.path(metadata_path, "meta_data_with_url.csv"))
+
+# Standardize column names
+setnames(url_meta, 
+    old = c("Tissue.Sample.ID", "Tissue", "Subject.ID", "Sex", 
+            "Age.Bracket", "Hardy.Scale", "Pathology.Categories", 
+            "Pathology.Notes", "url"),
+    new = c("sample_id", "tissue", "subject", "sex", 
+            "age_range", "death_rate", "path_category", 
+            "path_notes", "url"))
+
+# Process tissue information
+url_meta <- as.data.table(url_meta)
+url_meta[, c("tissue_main", "tissue_sub") := tstrsplit(tissue, " - ")]
+url_meta[tissue_main == "Minor Salivary Gland", tissue_main := "Salivary Gland"]
+url_meta[, tissue := NULL]
+
+# Load or process feature data
+data_csv_path <- file.path(data_path, "processed/gtex_sample.csv")
+
+if (file.exists(data_csv_path)) {
+  gtex_features <- data.table::fread(data_csv_path)
+  setkey(gtex_features, sample_id)
+  message(paste("Loaded", nrow(gtex_features), "samples with", ncol(gtex_features)-1, "features"))
+} else {
+  # Process H5 file if CSV doesn't exist
+  h5_contents <- h5ls(h5_path)
+  total_datasets <- sum(h5_contents$otype == "H5I_DATASET")
+  
+  data_list <- vector("list", total_datasets)
+  batch_size <- 1000
+  n_batches <- ceiling(total_datasets/batch_size)
+  
+  for(batch in 1:n_batches) {
+    start_idx <- (batch-1)*batch_size + 1
+    end_idx <- min(batch*batch_size, total_datasets)
+    
+    for(i in start_idx:end_idx) {
+      if(h5_contents$otype[i] == "H5I_DATASET") {
+        path <- if(h5_contents$group[i] == "/") {
+          h5_contents$name[i]
+        } else {
+          paste0(h5_contents$group[i], "/", h5_contents$name[i])
+        }
+        
+        features <- h5read(h5_path, path)
+        data_list[[i]] <- data.table(
+          sample_id = h5_contents$name[i],
+          t(features)
+        )
+      }
+    }
+    gc()
+  }
+  
+  gtex_features <- rbindlist(data_list, fill=TRUE)
+  setkey(gtex_features, sample_id)
+  names(gtex_features)[-1] <- paste0("feature_", seq_len(ncol(gtex_features)-1))
+  
+  fwrite(gtex_features, file.path(data_path, "processed/gtex_features.csv"))
+}
+
+# Clean sample IDs and merge data
+url_meta[, sample_id := str_extract(sample_id, "GTEX-[^-]+-[^-]+")]
+setkey(url_meta, sample_id)
+
+# Merge features with metadata
+merged_gtex <- merge(
+  gtex_features, 
+  url_meta[, !c("path_notes", "url"), with=FALSE], 
+  by="sample_id"
+)
+
+# Add quality metrics
+ds_attri <- as.data.table(ds_attri)
+ds_attri[, standardized_id := {
+    parts <- strsplit(SAMPID, "-")[[1]]
+    if(length(parts) >= 3) {
+        paste(parts[1:3], collapse = "-")
+    } else {
+        NA
+    }
+}, by = 1:nrow(ds_attri)]
+
+merged_gtex[, c("SMATSSCR", "SMRIN") := {
+    matching_attrs <- ds_attri[standardized_id == sample_id]
+    if(nrow(matching_attrs) > 0) {
+        .(matching_attrs$SMATSSCR[1], matching_attrs$SMRIN[1])
+    } else {
+        .(NA_real_, NA_real_)
+    }
+}, by = sample_id]
+
+# Save processed data
+fwrite(merged_gtex, file.path(data_path, "processed/merged_gtex_data.csv"))
+saveRDS(merged_gtex, file.path(data_path, "processed/merged_gtex.rds"))
+
+message(paste("Data integration complete. Dataset has", nrow(merged_gtex), "rows and", ncol(merged_gtex), "columns"))
+```
+
+#------------------------------------------------------------------------------
+# 4. Demographics and Tissue Distribution Analysis
+#------------------------------------------------------------------------------
+
+```{r}
+# Calculate demographics
+total_samples <- nrow(merged_gtex)
+total_males <- sum(merged_gtex$sex == "male")
+total_females <- sum(merged_gtex$sex == "female")
+
+# Create tissue distribution summary
+main_tissue_counts <- data.table(
+    tissue = names(table(merged_gtex$tissue_main)),
+    total_samples = as.numeric(table(merged_gtex$tissue_main))
+)[order(-total_samples)]
+
+# Create demographics plot
+age_sex_counts <- as.data.frame(table(merged_gtex$age_range, merged_gtex$sex))
+names(age_sex_counts) <- c("age_range", "sex", "count")
+
+sex_colors <- brewer.pal(8, "Set2")[1:2]
+names(sex_colors) <- c("female", "male")
+
+demographic_plot <- ggplot(age_sex_counts, aes(x = age_range, y = count, fill = sex)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  geom_text(aes(label = count), position = position_dodge(width = 0.9), 
+            vjust = -0.5, size = 3.5, fontface = "bold") +
+  theme_minimal() +
+  scale_fill_manual(values = sex_colors, name = "Sex") +
+  labs(x = "Age Range", y = "Number of Samples")
+
+ggsave(file.path(output_path, "demographics_plot.pdf"), demographic_plot, 
+       width = 12, height = 8, dpi = 300, bg = "white")
+
+# Create tissue barplot
+# tissue_colors <- setNames(rainbow(length(unique(main_tissue_counts$tissue)), s = 0.7, v = 0.9),
+#                          unique(main_tissue_counts$tissue))
+
+# Create colors for tissues
+tissue_order <- sort(unique(umap_data$tissue_main))
+n_tissues <- length(tissue_order)
+set.seed(123)
+tissue_colors <- setNames(rainbow(n_tissues, s = 0.7, v = 0.8), tissue_order)
+
+gtex_barplot <- ggplot(main_tissue_counts, aes(x = reorder(tissue, total_samples), y = total_samples)) +
+  geom_bar(stat = "identity", fill = tissue_colors[main_tissue_counts$tissue],
+           color = "white", linewidth = 0.3) +  # Changed 'size' to 'linewidth'
+  geom_text(aes(label = total_samples), hjust = -0.01, size = 3, fontface = "bold") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "GTEx Whole-Slide Sample Counts",
+       x = NULL, y = "# of Samples with Whole-Slide Images") +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    axis.text.y = element_text(size = 11, face = "bold")
+  )
+
+ggsave(file.path(output_path, "gtex_tissue_sample_counts.pdf"), 
+       gtex_barplot, width = 12, height = 10, dpi = 300, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 5. PCA Analysis
+#------------------------------------------------------------------------------
+
+```{r}
+# Extract and prepare features
+feature_cols <- grep("^feature_", names(merged_gtex), value = TRUE)
+feature_matrix <- as.matrix(merged_gtex[, ..feature_cols])
+
+# Remove constant columns
+column_vars <- apply(feature_matrix, 2, var)
+valid_cols <- column_vars > 1e-10
+feature_matrix <- feature_matrix[, valid_cols]
+
+# Perform PCA
+pca_result <- prcomp(feature_matrix, scale. = TRUE, center = TRUE, rank. = 50)
+var_explained <- pca_result$sdev^2
+prop_var <- var_explained / sum(var_explained)
+cum_var <- cumsum(prop_var)
+
+# Create PCA data
+pc_scores <- as.data.table(pca_result$x)
+metadata <- merged_gtex[, .(sample_id, tissue_main, tissue_sub, sex, age_range)]
+pca_data <- cbind(pc_scores[, .(PC1, PC2)], metadata)
+
+# Create scree plot
+var_data <- data.table(PC = 1:50, VarExplained = prop_var[1:50], CumVar = cum_var[1:50])
+key_points <- c(1, 2, 3, 4, 50)
+key_data <- var_data[PC %in% key_points]
+
+scree_plot <- ggplot(var_data) +
+   geom_col(aes(x = PC, y = VarExplained * 100), fill = "steelblue", alpha = 0.7) +
+   geom_line(aes(x = PC, y = CumVar * 100), color = "red", size = 1) +
+   geom_text_repel(data = key_data,
+                   aes(x = PC, y = CumVar * 100, 
+                       label = sprintf("PC%d: %.1f%%", PC, CumVar * 100))) +
+   theme_minimal() +
+   labs(x = "Principal Component", y = "Variance Explained (%)")
+
+ggsave(file.path(output_path, "scree_plot.pdf"), scree_plot, width = 10, height = 6)
+
+# Create PCA scatter plot
+n_tissues <- length(unique(pca_data$tissue_main))
+pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = tissue_main)) +
+   geom_point(alpha = 0.7) +
+   scale_color_manual(values = rainbow(n_tissues, s = 0.7, v = 0.9)) +
+   theme_minimal() +
+   labs(x = sprintf("PC1 (%.1f%%)", prop_var[1] * 100),
+        y = sprintf("PC2 (%.1f%%)", prop_var[2] * 100),
+        color = "Tissue Type")
+
+ggsave(file.path(output_path, "pca_plot.pdf"), pca_plot, width = 12, height = 8)
+
+# Save PCA results
+pca_results <- list(
+    pca_obj = pca_result,
+    variance_explained = prop_var,
+    cumulative_variance = cum_var,
+    pc_scores = pc_scores,
+    metadata = metadata
+)
+saveRDS(pca_results, file.path(data_path, "processed/pca_results.rds"))
+```
+
+#------------------------------------------------------------------------------
+# 6. UMAP Analysis
+#------------------------------------------------------------------------------
+
+```{r}
+# Perform UMAP with parameters for better clustering separation
+set.seed(42)
+pc_data <- as.matrix(pca_results$pc_scores[, 1:50])
+umap_coords <- umap(pc_data, n_neighbors = 50, min_dist = 0.2, spread = 1.5, n_epochs = 500)
+
+# Create UMAP data
+umap_data <- data.table(
+  UMAP1 = umap_coords[, 1],
+  UMAP2 = umap_coords[, 2],
+  tissue_main = pca_results$metadata$tissue_main,
+  tissue_sub = pca_results$metadata$tissue_sub
+)
+
+# Calculate tissue centroids for labeling
+tissue_centroids <- umap_data[, .(
+  UMAP1 = median(UMAP1),
+  UMAP2 = median(UMAP2)
+), by = tissue_main]
+
+# Create colors for tissues
+tissue_order <- sort(unique(umap_data$tissue_main))
+n_tissues <- length(tissue_order)
+set.seed(123)
+tissue_colors <- setNames(rainbow(n_tissues, s = 0.7, v = 0.8), tissue_order)
+
+# Create the clean plot without elliptical boundaries
+umap_plot <- ggplot(umap_data, aes(x = UMAP1, y = UMAP2, color = tissue_main)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = tissue_colors) +
+  geom_text_repel(
+    data = tissue_centroids,
+    aes(x = UMAP1, y = UMAP2, label = tissue_main),
+    size = 4, fontface = "bold", color = "black",
+    bg.color = "white", bg.r = 0.1,
+    inherit.aes = FALSE
+  ) +
+  theme_minimal() +
+  labs(x = "UMAP1", y = "UMAP2") +
+  theme(legend.position = "none",
+        axis.title.x = element_text(size = 16, face = "bold"),
+        axis.title.y = element_text(size = 16, face = "bold"),
+        axis.text.x = element_text(size = 12, face = "bold"),
+        axis.text.y = element_text(size = 12, face = "bold"))
+
+# Save the plot
+ggsave(file.path(output_path, "umap_plot.pdf"), umap_plot, 
+       width = 12, height = 10, dpi = 600, bg = "white")
+print(umap_plot)
+```
+#------------------------------------------------------------------------------
+# 6.1. UMAP with RIN Score Overlay - All Tissues
+#------------------------------------------------------------------------------
+```{r}
+# Add RIN data to existing UMAP coordinates
+umap_rin_data <- data.table(
+  UMAP1 = umap_data$UMAP1,
+  UMAP2 = umap_data$UMAP2,
+  tissue_main = umap_data$tissue_main,
+  RIN = merged_gtex$SMRIN[match(merged_gtex$sample_id, merged_gtex$sample_id)]
+)
+
+# Calculate tissue centroids for labeling
+tissue_centroids_rin <- umap_rin_data[, .(
+  UMAP1 = median(UMAP1),
+  UMAP2 = median(UMAP2)
+), by = tissue_main]
+
+# Calculate RIN availability stats
+total_samples_umap <- nrow(umap_rin_data)
+rin_available_umap <- sum(!is.na(umap_rin_data$RIN))
+rin_percentage <- round(rin_available_umap/total_samples_umap*100, 1)
+
+# Create UMAP with RIN overlay using inferno colors
+umap_rin_overlay <- ggplot(umap_rin_data, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(aes(color = RIN), size = 1.2, alpha = 0.7) +
+  scale_color_viridis_c(name = "RIN Score", option = "inferno", na.value = "lightgrey") +
+  geom_text_repel(
+    data = tissue_centroids_rin,
+    aes(x = UMAP1, y = UMAP2, label = tissue_main),
+    size = 4, fontface = "bold", color = "black",
+    bg.color = "white", bg.r = 0.1,
+    inherit.aes = FALSE
+  ) +
+  theme_minimal() +
+  labs(
+    x = "UMAP1", 
+    y = "UMAP2",
+    caption = paste0("RIN data available: ", rin_available_umap, "/", total_samples_umap, 
+                    " samples (", rin_percentage, "%)")
+  ) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+
+# Save the plot
+ggsave(file.path(output_path, "umap_rin_overlay_all_tissues.pdf"), 
+       umap_rin_overlay, width = 12, height = 10, dpi = 600, bg = "white")
+
+print(umap_rin_overlay)
+
+# Print summary statistics
+cat("RIN Score Summary:\n")
+cat("Min:", min(umap_rin_data$RIN, na.rm = TRUE), "\n")
+cat("Max:", max(umap_rin_data$RIN, na.rm = TRUE), "\n") 
+cat("Mean:", round(mean(umap_rin_data$RIN, na.rm = TRUE), 2), "\n")
+cat("Median:", round(median(umap_rin_data$RIN, na.rm = TRUE), 2), "\n")
+cat("Missing:", sum(is.na(umap_rin_data$RIN)), "samples\n")
+```
+
+#------------------------------------------------------------------------------
+# 7. Silhouette Analysis
+#------------------------------------------------------------------------------
+```{r}
+# Calculate silhouette scores
+umap_data_for_sil <- data.table(
+    UMAP1 = umap_data$UMAP1,  
+    UMAP2 = umap_data$UMAP2,  
+    tissue = umap_data$tissue_main  
+)
+tissue_factors <- as.factor(umap_data_for_sil$tissue)
+umap_data_for_sil[, cluster := as.numeric(tissue_factors)]
+
+dist_matrix <- dist(umap_data_for_sil[, .(UMAP1, UMAP2)])
+sil <- silhouette(umap_data_for_sil$cluster, dist_matrix)
+
+# Calculate tissue-wise silhouette scores
+sil_dt <- data.table(
+  sample_id = 1:nrow(sil),
+  cluster = sil[,1],
+  neighbor_cluster = sil[,2],
+  sil_width = sil[,3]
+)
+
+cluster_lookup <- data.table(
+  cluster = 1:length(levels(tissue_factors)),
+  tissue = levels(tissue_factors)
+)
+setkey(cluster_lookup, cluster)
+sil_dt[, tissue := cluster_lookup[cluster, tissue]]
+
+tissue_sil <- sil_dt[, .(
+    avg_silhouette = mean(sil_width),
+    sil_sd = sd(sil_width),
+    sil_se = sd(sil_width) / sqrt(.N),
+    n_samples = .N
+), by = tissue][order(-avg_silhouette)] 
+
+# Create lollipop plot
+tissue_sil$tissue_label <- paste0(tissue_sil$tissue, " (", tissue_sil$n_samples, ")")
+
+lollipop_plot <- ggplot(tissue_sil, aes(x = reorder(tissue, -avg_silhouette), y = avg_silhouette, color = tissue)) +
+  # Add segments for the lollipop sticks
+  geom_segment(aes(x = reorder(tissue, -avg_silhouette), 
+                   xend = reorder(tissue, -avg_silhouette), 
+                   y = 0, yend = avg_silhouette), linewidth = 0.6) +
+  # Add points for the lollipop heads with UNIFORM SIZE
+  geom_point(size = 5, alpha = 0.9) +
+  # Add error bars based on standard error
+  geom_errorbar(aes(ymin = avg_silhouette - sil_se, ymax = avg_silhouette + sil_se),
+               width = 0.3, color = "gray50", alpha = 0.7) +
+#  # Add sample count labels next to each point # Removed due to we dont want to see sample count #
+# geom_text_repel(aes(label = n_samples),
+#                 nudge_y = 0.03, # Small upward nudge
+#                 size = 4,
+#                 fontface = "bold",
+#                 color = "black",
+#                 box.padding = 0.3,
+#                 point.padding = 0.3,
+#                 max.overlaps = Inf) +
+  # Use consistent tissue colors from UMAP
+  scale_color_manual(values = tissue_colors) +
+  # Labels with increased font sizes
+  labs(
+    title = NULL,
+    y = "Silhouette score "
+  ) +
+  # Apply minimal theme with customizations
+  theme_minimal() +
+  theme(
+    # Increase title and axis label font sizes
+    axis.title.x = element_blank(), # Remove x-axis title completely
+    axis.title.y = element_text(size = 18, face = "bold", margin = margin(r = 10), 
+                               angle = 90, vjust = 0.5, hjust = 0.5),
+    # Rotate x-axis labels for better readability
+    axis.text.x = element_text(size = 16, angle = 60, hjust = 1),
+    axis.text.y = element_text(size = 14, face = "bold"),
+    # Remove legend since color is redundant with tissue names
+    legend.position = "none",
+    # Add grid lines for better readability
+    panel.grid.major.y = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    # Reduce margins to minimize white space
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20),
+    axis.title.y.left = element_text(margin = margin(r = 5)),
+    # Adjust spacing between x-axis labels
+    panel.spacing = unit(0.4, "lines")
+  ) +
+  # # Expand limits to make room for the sample count labels
+#   expand_limits(x = length(unique(tissue_sil$tissue)) + 1.5) + # Removed as we dont want to see sample count 
+  # Reduce x-axis white space
+  scale_x_discrete(expand = c(0.02, 0.02))
+
+print(paste("Mean silhouette width:", round(mean(sil[,3], na.rm = TRUE), 3)))
+print(paste("Median silhouette width:", round(median(sil[,3], na.rm = TRUE), 3)))
+
+ggsave(file.path(output_path, "lollipop_silhouette.pdf"), lollipop_plot, 
+       width = 12, height = 10, dpi = 600)
+
+# Save the Plot data
+fwrite(tissue_sil[, .(
+  tissue,
+  n_samples,
+  avg_silhouette,
+  sil_sd,
+  sil_se
+)], file.path(output_path, "silhouette_scores.csv"))
+
+saveRDS(list(
+    silhouette_scores = sil,
+    tissue_summaries = tissue_sil,
+    overall_mean = mean(sil[,3], na.rm = TRUE),
+    overall_median = median(sil[,3], na.rm = TRUE)
+), file.path(data_path, "processed/silhouette_lollipop_analysis.rds"))
+```
+
+#------------------------------------------------------------------------------
+# 8. Quality Metrics Analysis
+# 8.1  RIN Histogram
+#------------------------------------------------------------------------------
+
+```{r}
+rin_data <- merged_gtex[!is.na(SMRIN)]
+rin_breaks <- seq(1, 10.5, by = 0.5)
+rin_bins <- cut(rin_data$SMRIN, breaks = rin_breaks, include.lowest = TRUE, right = FALSE)
+rin_counts <- as.data.frame(table(rin_bins))
+names(rin_counts) <- c("bin", "count")
+
+rin_counts$midpoint <- as.numeric(sapply(as.character(rin_counts$bin), function(x) {
+  range_vals <- as.numeric(unlist(strsplit(gsub("\\[|\\)|\\[|\\]", "", x), ",")))
+  return(mean(range_vals))
+}))
+
+rin_threshold <- 7.0
+rin_counts$quality <- ifelse(rin_counts$midpoint < rin_threshold, "Low quality", "High quality")
+# Define more intuitive colors
+quality_colors <- c("High quality" = "#1f77b4",  # Blue (good/positive)
+                   "Low quality" = "#ff7f0e")   # Orange (poor/negative)
+
+names(quality_colors) <- c("High quality", "Low quality")
+
+rin_hist <- ggplot(rin_counts, aes(x = midpoint, y = count, fill = quality)) +
+  geom_bar(stat = "identity", color = "black", width = 0.5) +
+# geom_text(aes(label = count), vjust = -0.3, size = 4) +
+  geom_vline(xintercept = rin_threshold, linetype = "dashed", color = "black", size = 2) +
+  # Add threshold label
+  annotate("text", x = rin_threshold, y = 0, 
+           label = paste("Threshold = 7"), 
+           angle = 90, vjust = -0.5, hjust = -0.1, size = 6, color = "black") +
+  scale_fill_manual(values = quality_colors) +
+  scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 3500, by = 500)) +
+  labs(x = "RIN Score", y = "Number of Samples",
+       caption = paste0("Total samples: ", nrow(rin_data))) +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 18, face = "bold"),
+        legend.position = "top")
+
+ggsave(file.path(output_path, "rin_histogram.pdf"), rin_hist, 
+       width = 12, height = 7, dpi = 300, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 8. Quality Metrics Analysis
+# 8.2  Autolysis Histogram
+#------------------------------------------------------------------------------
+```{r}
+autolysis_data <- merged_gtex[!is.na(SMATSSCR)]
+autolysis_counts <- as.data.frame(table(autolysis_data$SMATSSCR))
+names(autolysis_counts) <- c("value", "count")
+autolysis_counts$value <- as.numeric(as.character(autolysis_counts$value))
+
+autolysis_threshold <- 2.0
+autolysis_counts$quality <- ifelse(autolysis_counts$value <= autolysis_threshold, 
+                                  "High quality", "Low quality")
+
+autolysis_hist <- ggplot(autolysis_counts, aes(x = value, y = count, fill = quality)) +
+  geom_bar(stat = "identity", color = "black", width = 0.95) +
+# geom_text(aes(label = count), vjust = -0.5, size = 4) +
+  geom_vline(xintercept = autolysis_threshold, linetype = "dashed", color = "black", size = 1) +
+  annotate("text", x = autolysis_threshold, y = 0, 
+           label = "Threshold = 2.0", 
+           angle = 90, vjust = -0.5, hjust = -1, size = 4, color = "black") +
+  scale_fill_manual(values = quality_colors) +
+  scale_x_continuous(breaks = sort(unique(autolysis_counts$value))) +
+  scale_y_continuous(breaks = seq(0, 12000, by = 2000)) +
+  labs(x = "Autolysis Score", y = "Number of Samples",
+       caption = paste0("Total samples: ", nrow(autolysis_data))) +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 18, face = "bold"),
+        legend.position = "top")
+
+ggsave(file.path(output_path, "autolysis_histogram.pdf"), autolysis_hist, 
+       width = 12, height = 7, dpi = 300, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 9. Variance Analysis (ANOVA)
+# 9.1 RIN variance by demographics (5 factors)
+#------------------------------------------------------------------------------
+```{r}
+rin_variance <- data.frame()
+
+# Tissue type
+if("tissue_main" %in% names(rin_data)) {
+  tissue_model <- aov(SMRIN ~ tissue_main, data = rin_data)
+  tissue_summary <- summary(tissue_model)[[1]]
+  tissue_var_explained <- tissue_summary$`Sum Sq`[1] / sum(tissue_summary$`Sum Sq`) * 100
+  tissue_p_value <- tissue_summary$`Pr(>F)`[1]
+  
+  rin_variance <- rbind(rin_variance, 
+                       data.frame(demographic = "tissue_main",
+                                 label = "Tissue Type",
+                                 var_explained = tissue_var_explained,
+                                 p_value = tissue_p_value))
+}
+
+# Sex
+if("sex" %in% names(rin_data)) {
+  sex_model <- aov(SMRIN ~ sex, data = rin_data)
+  sex_summary <- summary(sex_model)[[1]]
+  sex_var_explained <- sex_summary$`Sum Sq`[1] / sum(sex_summary$`Sum Sq`) * 100
+  sex_p_value <- sex_summary$`Pr(>F)`[1]
+  
+  rin_variance <- rbind(rin_variance, 
+                       data.frame(demographic = "sex",
+                                 label = "Sex",
+                                 var_explained = sex_var_explained,
+                                 p_value = sex_p_value))
+}
+
+# Age
+if("age_range" %in% names(rin_data)) {
+  age_model <- aov(SMRIN ~ age_range, data = rin_data)
+  age_summary <- summary(age_model)[[1]]
+  age_var_explained <- age_summary$`Sum Sq`[1] / sum(age_summary$`Sum Sq`) * 100
+  age_p_value <- age_summary$`Pr(>F)`[1]
+  
+  rin_variance <- rbind(rin_variance, 
+                       data.frame(demographic = "age_range",
+                                 label = "Age Range",
+                                 var_explained = age_var_explained,
+                                 p_value = age_p_value))
+}
+
+# Hardy Scale (Death Rate) - THE MISSING 5TH FACTOR
+if("death_rate" %in% names(rin_data)) {
+  hardy_model <- aov(SMRIN ~ death_rate, data = rin_data)
+  hardy_summary <- summary(hardy_model)[[1]]
+  hardy_var_explained <- hardy_summary$`Sum Sq`[1] / sum(hardy_summary$`Sum Sq`) * 100
+  hardy_p_value <- hardy_summary$`Pr(>F)`[1]
+  
+  rin_variance <- rbind(rin_variance, 
+                       data.frame(demographic = "death_rate",
+                                 label = "Hardy Scale",
+                                 var_explained = hardy_var_explained,
+                                 p_value = hardy_p_value))
+}
+
+# Autolysis effect on RIN
+both_metrics_samples <- merged_gtex[!is.na(SMRIN) & !is.na(SMATSSCR)]
+autolysis_model <- aov(SMRIN ~ SMATSSCR, data = both_metrics_samples)
+autolysis_summary <- summary(autolysis_model)[[1]]
+autolysis_var_explained <- autolysis_summary$`Sum Sq`[1] / sum(autolysis_summary$`Sum Sq`) * 100
+autolysis_p_value <- autolysis_summary$`Pr(>F)`[1]
+
+rin_variance <- rbind(rin_variance, 
+                     data.frame(demographic = "SMATSSCR",
+                               label = "Autolysis Score",
+                               var_explained = autolysis_var_explained,
+                               p_value = autolysis_p_value))
+
+rin_variance <- rin_variance[order(-rin_variance$var_explained),]
+rin_variance$significance <- ifelse(rin_variance$p_value < 0.001, "***",
+                                  ifelse(rin_variance$p_value < 0.01, "**",
+                                        ifelse(rin_variance$p_value < 0.05, "*", "ns")))
+
+# Create RIN variance plot
+rin_variance_plot <- ggplot(rin_variance, 
+                           aes(y = reorder(label, var_explained), x = var_explained)) +
+  geom_bar(stat = "identity", fill = "#66C2A5", width = 0.8) +
+  # Conditional text positioning based on bar length
+  geom_text(aes(label = paste0(round(var_explained, 1), "%"),
+                x = ifelse(var_explained > 3, var_explained/2, var_explained),  # Middle of bar if >3%, at end if ≤3%
+                hjust = ifelse(var_explained > 3, 0.5, -0.1)),  # Centered if >3%, outside if ≤3%
+            size = 6, fontface = "bold", color = "black") +
+  geom_text(aes(label = significance, 
+                x = ifelse(var_explained > 3, var_explained + 0.5, var_explained + 2)), 
+            hjust = 0, size = 6, color = "black") +
+  labs(x = "Variance Explained (%)", y = NULL) +
+  scale_x_continuous(limits = c(0, max(rin_variance$var_explained) + 4), 
+                     breaks = seq(0, ceiling(max(rin_variance$var_explained)/5)*5, 5)) +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size = 18, face = "bold"),
+        axis.text.y = element_text(size = 14, face = "bold"))
+
+ggsave(file.path(output_path, "rin_variance.pdf"), rin_variance_plot, 
+       width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+#------------------------------------------------------------------------------
+# 9. Variance Analysis (ANOVA)
+# 9.2 AUTOLYSIS variance by demographics (5 factors)
+#------------------------------------------------------------------------------
+```{r}
+autolysis_variance <- data.frame()
+
+# Tissue type
+if("tissue_main" %in% names(autolysis_data)) {
+  tissue_model_aut <- aov(SMATSSCR ~ tissue_main, data = autolysis_data)
+  tissue_summary_aut <- summary(tissue_model_aut)[[1]]
+  tissue_var_explained_aut <- tissue_summary_aut$`Sum Sq`[1] / sum(tissue_summary_aut$`Sum Sq`) * 100
+  tissue_p_value_aut <- tissue_summary_aut$`Pr(>F)`[1]
+  
+  autolysis_variance <- rbind(autolysis_variance, 
+                             data.frame(demographic = "tissue_main",
+                                       label = "Tissue Type",
+                                       var_explained = tissue_var_explained_aut,
+                                       p_value = tissue_p_value_aut))
+}
+
+# Sex
+if("sex" %in% names(autolysis_data)) {
+  sex_model_aut <- aov(SMATSSCR ~ sex, data = autolysis_data)
+  sex_summary_aut <- summary(sex_model_aut)[[1]]
+  sex_var_explained_aut <- sex_summary_aut$`Sum Sq`[1] / sum(sex_summary_aut$`Sum Sq`) * 100
+  sex_p_value_aut <- sex_summary_aut$`Pr(>F)`[1]
+  
+  autolysis_variance <- rbind(autolysis_variance, 
+                             data.frame(demographic = "sex",
+                                       label = "Sex",
+                                       var_explained = sex_var_explained_aut,
+                                       p_value = sex_p_value_aut))
+}
+
+# Age
+if("age_range" %in% names(autolysis_data)) {
+  age_model_aut <- aov(SMATSSCR ~ age_range, data = autolysis_data)
+  age_summary_aut <- summary(age_model_aut)[[1]]
+  age_var_explained_aut <- age_summary_aut$`Sum Sq`[1] / sum(age_summary_aut$`Sum Sq`) * 100
+  age_p_value_aut <- age_summary_aut$`Pr(>F)`[1]
+  
+  autolysis_variance <- rbind(autolysis_variance, 
+                             data.frame(demographic = "age_range",
+                                       label = "Age Range",
+                                       var_explained = age_var_explained_aut,
+                                       p_value = age_p_value_aut))
+}
+
+# Hardy Scale (Death Rate) - THE MISSING 5TH FACTOR
+if("death_rate" %in% names(autolysis_data)) {
+  hardy_model_aut <- aov(SMATSSCR ~ death_rate, data = autolysis_data)
+  hardy_summary_aut <- summary(hardy_model_aut)[[1]]
+  hardy_var_explained_aut <- hardy_summary_aut$`Sum Sq`[1] / sum(hardy_summary_aut$`Sum Sq`) * 100
+  hardy_p_value_aut <- hardy_summary_aut$`Pr(>F)`[1]
+  
+  autolysis_variance <- rbind(autolysis_variance, 
+                             data.frame(demographic = "death_rate",
+                                       label = "Hardy Scale",
+                                       var_explained = hardy_var_explained_aut,
+                                       p_value = hardy_p_value_aut))
+}
+
+# RIN effect on Autolysis
+rin_model_aut <- aov(SMATSSCR ~ SMRIN, data = both_metrics_samples)
+rin_summary_aut <- summary(rin_model_aut)[[1]]
+rin_var_explained_aut <- rin_summary_aut$`Sum Sq`[1] / sum(rin_summary_aut$`Sum Sq`) * 100
+rin_p_value_aut <- rin_summary_aut$`Pr(>F)`[1]
+
+autolysis_variance <- rbind(autolysis_variance, 
+                           data.frame(demographic = "SMRIN",
+                                     label = "RIN Score",
+                                     var_explained = rin_var_explained_aut,
+                                     p_value = rin_p_value_aut))
+
+autolysis_variance <- autolysis_variance[order(-autolysis_variance$var_explained),]
+autolysis_variance$significance <- ifelse(autolysis_variance$p_value < 0.001, "***",
+                                         ifelse(autolysis_variance$p_value < 0.01, "**",
+                                               ifelse(autolysis_variance$p_value < 0.05, "*", "ns")))
+
+# Create Autolysis variance plot with conditional text positioning
+autolysis_variance_plot <- ggplot(autolysis_variance, 
+                                 aes(y = reorder(label, var_explained), x = var_explained)) +
+  geom_bar(stat = "identity", fill = "#FC8D62", width = 0.8) +
+  # Conditional text positioning based on bar length
+  geom_text(aes(label = paste0(round(var_explained, 1), "%"),
+                x = ifelse(var_explained > 4, var_explained/2, var_explained),  # Middle of bar if >5%, at end if ≤5%
+                hjust = ifelse(var_explained > 4, 0.5, -0.1)),  # Centered if >5%, outside if ≤5%
+            size = 6, fontface = "bold", color = "black") +
+  geom_text(aes(label = significance, 
+                x = ifelse(var_explained > 5, var_explained + 0.5, var_explained + 2)), 
+            hjust = 0, size = 6, color = "black") +
+  labs(x = "Variance Explained (%)", y = NULL) +
+  scale_x_continuous(limits = c(0, max(autolysis_variance$var_explained) + 4), 
+                     breaks = seq(0, ceiling(max(autolysis_variance$var_explained)/5)*5, 5)) +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size = 18, face = "bold"),
+        axis.text.y = element_text(size = 14, face = "bold"))
+
+ggsave(file.path(output_path, "autolysis_variance.pdf"), autolysis_variance_plot, 
+       width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+
+#------------------------------------------------------------------------------
+# 9. Variance Analysis (ANOVA)
+# 9.3 Correlation Analysis
+#------------------------------------------------------------------------------
+```{r}
+# Calculate tissue-specific correlations
+tissues <- unique(both_metrics_samples$tissue_main)
+tissue_corr <- data.frame()
+
+for (tissue in tissues) {
+  tissue_samples <- both_metrics_samples[both_metrics_samples$tissue_main == tissue,]
+  
+  if (nrow(tissue_samples) >= 3) {
+    cor_test <- cor.test(tissue_samples$SMRIN, tissue_samples$SMATSSCR, 
+                        method = "spearman", exact = FALSE)
+    
+    tissue_corr <- rbind(tissue_corr, 
+                        data.frame(tissue_main = tissue,
+                                  correlation = cor_test$estimate,
+                                  p_value = cor_test$p.value,
+                                  n_samples = nrow(tissue_samples)))
+  }
+}
+
+tissue_corr$significance <- ifelse(tissue_corr$p_value < 0.001, "***",
+                                 ifelse(tissue_corr$p_value < 0.01, "**",
+                                       ifelse(tissue_corr$p_value < 0.05, "*", "ns")))
+
+tissue_corr <- tissue_corr[order(-abs(tissue_corr$correlation)),]
+tissue_corr$tissue_label <- paste0(tissue_corr$tissue_main, " (", tissue_corr$n_samples, ")")
+
+# Create correlation plot
+correlation_plot <- ggplot(tissue_corr, 
+          aes(x = reorder(tissue_label, correlation), y = correlation)) +
+  coord_flip() +
+  geom_bar(stat = "identity", aes(fill = correlation), width = 0.7) +
+  scale_fill_gradient2(low = "#E6A945", mid = "#FFFFFF", high = "#45D5E6",
+                      midpoint = 0, name = "Correlation") +
+  geom_text(aes(label = round(correlation, 2), y = correlation/2),
+            color = "black", size = 4, fontface = "bold") +
+  geom_text(aes(label = significance,
+                y = ifelse(correlation >= 0, correlation + 0.03, correlation - 0.03)),
+            color = "black", size = 5) +
+  labs(y = "Spearman Correlation Coefficient", x = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top",
+        axis.text.y = element_text(size = 18, margin = margin(r = 5), lineheight = 0.7))
+
+ggsave(file.path(output_path, "correlation_Variance.pdf"), correlation_plot, 
+       width = 11, height = 9, dpi = 300, bg = "white")
+```
+#------------------------------------------------------------------------------
+# 9. Variance Analysis (ANOVA)
+# 9.4 Age-Related Correlations with Tissue Quality
+#------------------------------------------------------------------------------
+```{r}
+# Calculate age correlations with RIN by tissue
+age_rin_correlations <- data.frame()
+
+for(tissue in unique(rin_data$tissue_main)) {
+  tissue_subset <- rin_data[rin_data$tissue_main == tissue, ]
+  
+  if(nrow(tissue_subset) >= 10) {
+    # Convert age_range to numeric (use midpoint of ranges)
+    tissue_subset$age_numeric <- case_when(
+      tissue_subset$age_range == "20-29" ~ 25,
+      tissue_subset$age_range == "30-39" ~ 35, 
+      tissue_subset$age_range == "40-49" ~ 45,
+      tissue_subset$age_range == "50-59" ~ 55,
+      tissue_subset$age_range == "60-69" ~ 65,
+      tissue_subset$age_range == "70-79" ~ 75,
+      TRUE ~ NA_real_
+    )
+    
+    cor_test <- cor.test(tissue_subset$age_numeric, tissue_subset$SMRIN, 
+                        method = "spearman", exact = FALSE)
+    
+    age_rin_correlations <- rbind(age_rin_correlations, 
+                                 data.frame(
+                                   tissue_main = tissue,
+                                   correlation = cor_test$estimate,
+                                   p_value = cor_test$p.value,
+                                   n_samples = nrow(tissue_subset)
+                                 ))
+  }
+}
+
+age_rin_correlations$significance <- ifelse(age_rin_correlations$p_value < 0.001, "***",
+                                           ifelse(age_rin_correlations$p_value < 0.01, "**",
+                                                 ifelse(age_rin_correlations$p_value < 0.05, "*", "ns")))
+
+age_rin_correlations <- age_rin_correlations[order(age_rin_correlations$correlation), ]
+
+# Create age correlation plot
+age_correlation_plot <- ggplot(age_rin_correlations, 
+                              aes(x = reorder(tissue_main, correlation), y = correlation)) +
+  geom_bar(stat = "identity", aes(fill = correlation), width = 0.7) +
+  scale_fill_gradient2(low = "#E74C3C", mid = "#FFFFFF", high = "#3498DB",
+                      midpoint = 0, name = "Correlation") +
+  geom_text(aes(label = round(correlation, 2), y = correlation/2),
+            color = "black", size = 3, fontface = "bold") +
+  geom_text(aes(label = significance,
+                y = ifelse(correlation >= 0, correlation + 0.03, correlation - 0.03)),
+            color = "black", size = 4) +
+  coord_flip() +
+  labs(y = "Spearman Correlation with Age", x = NULL) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 12))
+
+ggsave(file.path(output_path, "age_correlation_plot.pdf"), age_correlation_plot, 
+       width = 10, height = 8, dpi = 300, bg = "white")
+
+# Print key findings
+cat("Age-RIN Correlations:\n")
+cat("Strongest negative:", age_rin_correlations$tissue_main[1], 
+    "r =", round(age_rin_correlations$correlation[1], 3), "\n")
+cat("Strongest positive:", age_rin_correlations$tissue_main[nrow(age_rin_correlations)], 
+    "r =", round(age_rin_correlations$correlation[nrow(age_rin_correlations)], 3), "\n")
+```
+
+#------------------------------------------------------------------------------
+# 10. Esophagus-Specific Analysis Overlaying Rin and Autolysis 
+#------------------------------------------------------------------------------
+```{r}
+# Select Esophagus samples
+esophagus_samples <- merged_gtex[tissue_main == "Esophagus"]
+
+if(nrow(esophagus_samples) >= 10) {
+  # Extract features and run UMAP
+  feature_cols <- grep("^feature_", names(esophagus_samples), value = TRUE)
+  feature_matrix <- as.matrix(esophagus_samples[, ..feature_cols])
+  feature_matrix <- scale(feature_matrix[, apply(feature_matrix, 2, var) > 1e-10])
+  
+  set.seed(123)
+  umap_result <- umap(feature_matrix, n_neighbors = 15, n_components = 2)
+  
+  umap_df <- data.frame(
+      UMAP1 = umap_result[,1],
+      UMAP2 = umap_result[,2],
+      Subtype = esophagus_samples$tissue_sub,
+      RIN = esophagus_samples$SMRIN,
+      Autolysis = esophagus_samples$SMATSSCR
+  )
+  # Calculate sample counts for overlays
+  total_samples <- nrow(umap_df)
+  rin_available <- sum(!is.na(umap_df$RIN))
+  autolysis_available <- sum(!is.na(umap_df$Autolysis))
+  
+  # Create subtype UMAP
+  esophagus_labels <- c("Gastroesophageal\nJunction", "Mucosa", "Muscularis")
+ 
+  custom_colors <- c(
+  "Gastroesophageal Junction" = "#56B4E9",  # Light blue
+  "Mucosa" = "#40E0D0",                      # Turquoise
+  "Muscularis" = "#808000"                   # Olive
+)
+  esophagus_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Subtype)) +
+      geom_point(size = 3, alpha = 0.7) +
+      theme_minimal() +
+      labs(color = "Esophagus\nSubtype", 
+           x = "UMAP1", 
+           y = "UMAP2")  +
+      scale_color_manual(values = custom_colors,, labels = esophagus_labels) +
+      theme(legend.position = "bottom",
+            legend.title = element_text(size = 14, face = "bold"),
+            legend.text = element_text(size = 12),
+            axis.title = element_text(size = 16, face = "bold"),
+            axis.text = element_text(size = 14),
+            plot.title = element_text( NULL))
+  
+  # Create RIN overlay
+  esophagus_rin <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2)) +
+      geom_point(aes(color = RIN), size = 3, alpha = 0.7) +
+      scale_color_viridis_c(name = "RIN Score",option = "plasma", na.value = "lightgrey") +
+      theme_minimal() +
+      labs(x = "UMAP1", 
+           y = "UMAP2",
+           caption = paste0("RIN data available: ", rin_available, "/", total_samples, 
+                           " samples (", round(rin_available/total_samples*100, 1), "%)")) +
+      theme(legend.position = "right",
+            legend.title = element_text(size = 14, face = "bold"),
+            legend.text = element_text(size = 12),
+            axis.title = element_text(size = 16, face = "bold"),
+            axis.text = element_text(size = 14),
+            plot.title = element_text( NULL))
+  
+  # Create Autolysis overlay
+  esophagus_autolysis <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2)) +
+      geom_point(aes(color = Autolysis), size = 3, alpha = 0.7) +
+      scale_color_viridis_c(name = "Autolysis Score", option = "inferno", na.value = "lightgrey") +
+      theme_minimal() +
+      labs(x = "UMAP1", 
+           y = "UMAP2",
+           caption = paste0("Autolysis data available: ", autolysis_available, "/", total_samples, 
+                           " samples (", round(autolysis_available/total_samples*100, 1), "%)")) +
+      theme(legend.position = "right",
+            legend.title = element_text(size = 14, face = "bold"),
+            legend.text = element_text(size = 12),
+            axis.title = element_text(size = 16, face = "bold"),
+            axis.text = element_text(size = 14),
+            plot.title = element_text( NULL))
+        
+  # Save plots
+  ggsave(file.path(output_path, "esophagus_umap.pdf"), esophagus_umap, 
+         width = 8, height = 7, dpi = 600, bg = "white")
+  ggsave(file.path(output_path, "esophagus_rin.pdf"), esophagus_rin, 
+         width = 8, height = 7, dpi = 600, bg = "white")
+  ggsave(file.path(output_path, "esophagus_autolysis.pdf"), esophagus_autolysis, 
+         width = 8, height = 7, dpi = 600, bg = "white")
+  
+   # Save results
+   saveRDS(list(
+       umap_coordinates = umap_result,
+       plotting_data = umap_df,
+       sample_counts = list(
+         total = total_samples,
+         rin_available = rin_available,
+         autolysis_available = autolysis_available
+       )
+   ), file.path(data_path, "processed/esophagus_umap_analysis.rds"))
+  }
+```
+#------------------------------------------------------------------------------
+# 10.1 PERMANOVA Analysis for All Tissues and Subtypes
+#------------------------------------------------------------------------------
+```{r}
+library(vegan)
+
+# Function to perform PERMANOVA for all tissues
+analyze_all_tissues_permanova <- function(merged_gtex) {
+  tissues <- unique(merged_gtex$tissue_main)
+  results <- data.frame()
+  
+  for(tissue in tissues) {
+    tissue_data <- merged_gtex[tissue_main == tissue & !is.na(tissue_sub)]
+    subtypes <- unique(tissue_data$tissue_sub)
+    
+    if(nrow(tissue_data) < 15 | length(subtypes) < 2) next
+    
+    # Get features and scale
+    feature_cols <- grep("^feature_", names(tissue_data), value = TRUE)
+    features <- scale(as.matrix(tissue_data[, ..feature_cols]))
+    features <- features[, apply(features, 2, var, na.rm = TRUE) > 1e-10]
+    
+    # PERMANOVA test
+    dist_mat <- dist(features)
+    perm_test <- adonis2(dist_mat ~ tissue_sub, data = tissue_data, permutations = 999)
+    
+    # Store results
+    results <- rbind(results, data.frame(
+      tissue = tissue,
+      n_samples = nrow(tissue_data),
+      n_subtypes = length(subtypes),
+      r_squared = round(perm_test$R2[1], 4),
+      r_value = round(sqrt(perm_test$R2[1]), 4),
+      p_value = round(perm_test$`Pr(>F)`[1], 4),
+      significant = perm_test$`Pr(>F)`[1] < 0.05
+    ))
+  }
+  
+  return(results[order(-results$r_squared), ])
+}
+
+# Run analysis and save
+permanova_results <- analyze_all_tissues_permanova(merged_gtex)
+write.csv(permanova_results, file.path(output_path, "tissue_permanova_results.csv"), row.names = FALSE)
+
+# Show significant results
+significant <- permanova_results[permanova_results$significant == TRUE, ]
+print(significant)
+```
+
+
+#------------------------------------------------------------------------------
+# 11. Combined Figures (merging framework figure from biorender)
+#------------------------------------------------------------------------------
+
+```{r}
+# Load BioRender PDF as image
+biorender_img <- magick::image_read("output/figures/PathQC_framework.png", density = 600)[1]
+
+# Convert to ggdraw-compatible plot
+biorender_plot <- ggdraw() + draw_image(biorender_img)
+
+# Row 1: Panel A (BioRender)
+first_row <- plot_grid(
+  biorender_plot,
+  labels = "A",
+  label_size = 16,
+  rel_heights = c(0.9),
+  ncol = 1
+)
+
+CD_stack <- plot_grid(
+  rin_hist,
+  autolysis_hist,
+  labels = c("C", "D"),
+  label_size = 16,
+  nrow = 2,  # Stack vertically
+  ncol = 1
+)
+
+# Row 2: Panel B (UMAP) 
+second_row <- plot_grid(
+  umap_rin_overlay,
+  CD_stack,
+  labels = c("B", ""),
+  label_size = 16,
+  rel_widths = c(1.4,1),
+  nrow = 1,  # Stack vertically
+  ncol = 2
+)
+# # Row 3: Panel D (RIN) and Panel E (Autolysis) ## use if figure needed for horizontal ##
+# third_row <- plot_grid(
+#   rin_hist,
+#   autolysis_hist,
+#   labels = c("C", "D"),
+#   label_size = 16,
+#   rel_widths = c(1, 1),
+#   nrow = 1
+# )
+
+# Row 4: Panel F (Esophagus UMAP), G (RIN), H (Autolysis)
+# third_row <- plot_grid(
+#   esophagus_umap,
+#   esophagus_rin,
+#   esophagus_autolysis,
+#   labels = c("E", "F", "G"),
+#   label_size = 16,
+#   rel_widths = c(1, 1, 1),
+#   nrow = 1
+# )
+
+# Combine all rows with custom spacing
+combined_plot_final <- plot_grid(
+  first_row,
+  second_row,
+# third_row,
+  ncol = 1,
+  rel_heights = c(1, 1.5, 1),
+  align = "v",           # Vertical alignment
+  axis = "lr",           # Align left-right axes
+  vjust = 0.5,          # Vertical justification
+  hjust = 0.5           # Horizontal justification
+)
+
+# Save final figure
+save_plot(
+  filename = file.path(output_path, "Figure1.pdf"),
+  plot = combined_plot_final,
+  base_width = 16,
+  base_height = 14,
+  dpi = 600,
+  bg = "white"
+)
+```
+
+#------------------------------------------------------------------------------
+# 11.1 Figure 2
+#------------------------------------------------------------------------------
+```{r}
+# Figure 2 - Quality Metrics Analysis
+if(exists("rin_variance_plot") && exists("autolysis_variance_plot") && exists("correlation_plot")) {
+  rin_variance_plot_labeled <- rin_variance_plot + labs(tag = "A")
+  autolysis_variance_plot_labeled <- autolysis_variance_plot + labs(tag = "B")
+  correlation_plot_labeled <- correlation_plot + labs(tag = "C")
+  
+  figure2_patchwork <- (rin_variance_plot_labeled / autolysis_variance_plot_labeled) | correlation_plot_labeled
+  
+  ggsave(file.path(output_path, "Figure2.pdf"), figure2_patchwork, 
+         width = 16, height = 10, dpi = 300, bg = "white")
+}
+```
+
+#------------------------------------------------------------------------------
+# 11.2 Combined Figures Supplemantary figure 10 (original)
+#------------------------------------------------------------------------------
+```{r}
+ # Create first row: Panel A (scree plot) and Panel B (pca plot)
+ first_row <- plot_grid(
+   scree_plot,
+   pca_plot,
+   labels = c("A", "B"),
+   label_size = 16,
+   rel_widths = c(1, 1),
+   nrow = 2,
+   ncol = 1
+ )
+ # Create second row: Panel C (Gtex Demographic) and Panel D (lollipop plot)
+ second_row <- plot_grid(
+   gtex_barplot ,
+   lollipop_plot,
+   labels = c("C", "D"),
+   label_size = 16,
+   rel_widths = c(1, 1),
+   nrow = 2,
+   ncol = 1
+ )
+ # Combine all rows into the final figure
+ Supplementary_combined <- plot_grid(
+   first_row,
+   second_row,
+   ncol = 2,
+   rel_heights = c(1, 1)
+ )
+# # Save the combined figure
+ save_plot(file.path(output_path, "Supplemantary4.pdf"), Supplementary_combined,
+           base_width = 16, base_height = 14, dpi = 600, bg = "white")
+```
+#------------------------------------------------------------------------------
+# 12. Save Final Results
+#------------------------------------------------------------------------------
+```{r}
+# Create final summary
+final_results <- list(
+  metadata = list(
+    completion_time = Sys.time(),
+    total_samples = nrow(merged_gtex),
+    tissues_count = length(unique(merged_gtex$tissue_main)),
+    features_count = length(grep("^feature_", names(merged_gtex)))
+  ),
+  quality = list(
+    rin = list(
+      mean = mean(merged_gtex$SMRIN, na.rm = TRUE),
+      median = median(merged_gtex$SMRIN, na.rm = TRUE),
+      missing = sum(is.na(merged_gtex$SMRIN))
+    ),
+    autolysis = list(
+      mean = mean(merged_gtex$SMATSSCR, na.rm = TRUE),
+      median = median(merged_gtex$SMATSSCR, na.rm = TRUE),
+      missing = sum(is.na(merged_gtex$SMATSSCR))
+    )
+  )
+)
+saveRDS(final_results, file.path(data_path, "processed/gtex_analysis_complete.rds"))
+# Write completion to log
+write(paste("\nAnalysis completed:", Sys.time()), log_file, append = TRUE)
+message("GTEx analysis pipeline completed successfully!")
+```
+
+#------------------------------------------------------------------------------
+# Count The Total Number of patches 
+#------------------------------------------------------------------------------
+```{r}
+# Load the patch counts data
+patch_counts <- read.csv("data/raw/GTEX_AGGREGATED/patch_counts.csv")
+
+# Quick check of the data
+head(patch_counts)
+str(patch_counts)
+
+# Verify the totals match what we found on HPC
+nrow(patch_counts)  # Should be 25,321 slides
+sum(patch_counts$patch_count)  # Should be 30,331,021 patches
+
+# Now load your actual analysis dataset
+# (Replace with your actual merged_gtex dataset)
+# merged_gtex <- read.csv("your_analysis_data.csv")
+
+# Match the datasets to get exact patch count for your analysis
+patch_data <- merge(merged_gtex, patch_counts, 
+                      by.x = "sample_id", by.y = "slide_id")
+
+patch_data <- as.data.frame(patch_data)
+patch_data[,4105:4107]
+
+# # Get the exact patch count used in your study
+total_patches_used <- sum(patch_data$patch_count)
+cat("Total patches analysis:", total_patches_used)
+
+# Find samples left out when merging
+patch_counts[!patch_counts$slide_id %in% merged_gtex$sample_id, ]
+```
+
+#------------------------------------------------------------------------------
+# Table 1: GTEx Tissue Sample Counts with RIN and Autolysis Data
+#------------------------------------------------------------------------------
+```{r}
+# Create Table 1 data
+create_gtex_table1 <- function(merged_gtex) {
+  # Calculate tissue-level statistics
+  table1_data <- merged_gtex[, .(
+    `Total Samples` = .N,
+    `RIN Available` = sum(!is.na(SMRIN)),
+    `RIN (%)` = round(100 * sum(!is.na(SMRIN)) / .N, 1),
+    `Autolysis Available` = sum(!is.na(SMATSSCR)),
+    `Autolysis (%)` = round(100 * sum(!is.na(SMATSSCR)) / .N, 1),
+    `Both Available` = sum(!is.na(SMRIN) & !is.na(SMATSSCR)),
+    `Both (%)` = round(100 * sum(!is.na(SMRIN) & !is.na(SMATSSCR)) / .N, 1)
+  ), by = tissue_main]
+  
+  # Rename tissue column
+  setnames(table1_data, "tissue_main", "Tissue Type")
+  
+  # Order by total sample size
+  table1_data <- table1_data[order(-`Total Samples`)]
+  
+  # Add totals row
+  totals_row <- data.table(
+    `Tissue Type` = "TOTAL",
+    `Total Samples` = nrow(merged_gtex),
+    `RIN Available` = sum(!is.na(merged_gtex$SMRIN)),
+    `RIN (%)` = round(100 * sum(!is.na(merged_gtex$SMRIN)) / nrow(merged_gtex), 1),
+    `Autolysis Available` = sum(!is.na(merged_gtex$SMATSSCR)),
+    `Autolysis (%)` = round(100 * sum(!is.na(merged_gtex$SMATSSCR)) / nrow(merged_gtex), 1),
+    `Both Available` = sum(!is.na(merged_gtex$SMRIN) & !is.na(merged_gtex$SMATSSCR)),
+    `Both (%)` = round(100 * sum(!is.na(merged_gtex$SMRIN) & !is.na(merged_gtex$SMATSSCR)) / nrow(merged_gtex), 1)
+  )
+  # Combine main data with totals
+  table1_final <- rbind(table1_data, totals_row)
+  
+  return(table1_final)
+}
+# Generate Table 1
+table1 <- create_gtex_table1(merged_gtex)
+
+# Save as CSV
+fwrite(table1, file.path(output_path, "Table1_GTEx_Sample_Counts.csv"))
+
+print(table1)
+```
+
+```{r}
+# Simple code to get unique tissue and subtissue counts
+
+# Number of unique main tissues
+n_main_tissues <- length(unique(merged_gtex$tissue_main))
+cat("Number of unique main tissues:", n_main_tissues, "\n")
+
+# Number of unique subtissues  
+n_subtissues <- length(unique(merged_gtex$tissue_sub))
+cat("Number of unique subtissues:", n_subtissues, "\n")
+
+# List the main tissues
+main_tissues <- sort(unique(merged_gtex$tissue_main))
+cat("\nMain tissues:\n")
+print(main_tissues)
+
+# List the subtissues
+subtissues <- sort(unique(merged_gtex$tissue_sub))
+cat("\nSubtissues:\n")
+print(subtissues)
+
+# One-liner summary
+cat(sprintf("\nSummary: %d main tissues, %d subtissues\n", n_main_tissues, n_subtissues))
+```

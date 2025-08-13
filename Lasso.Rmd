@@ -243,7 +243,7 @@ for(target in targets) {
     
     target_results[[tissue_name]] <- tissue_model_result
     
-    # Create visualization for good models (using R > 0.55 which is approximately R² > 0.3)
+    # Create visualization for good models (using R > 0.55)
   # if(pooled_r2 > 0.3) {  # use if R² is required
     if(abs(pooled_r) > 0.55) {
       scatter_plot <- ggplot(all_fold_predictions, aes(x = actual, y = predicted)) +
@@ -802,6 +802,57 @@ figure4 <- plot_grid(heatmaps, venn_plot, nrow = 2, rel_heights = c(2, 1.5))
 
 ggsave(file.path(output_path, "Figure4_Feature.pdf"), 
        figure4, width = 14, height = 12, dpi = 600, bg = "transparent")
+```
+```{r}
+# Update the create_heatmap function to include clustering
+create_heatmap <- function(feature_data, color_palette) {
+  feature_long <- reshape2::melt(feature_data$matrix, id.vars = "feature",
+                               variable.name = "tissue", value.name = "count")
+  
+  feature_long <- merge(feature_long, feature_data$summary[, c("feature", "total_count")], by = "feature")
+  feature_long$feature_label <- sub("feature_", "", feature_long$feature)
+  
+  # Create matrix for clustering
+  clustering_matrix <- feature_data$matrix
+  rownames(clustering_matrix) <- clustering_matrix$feature
+  clustering_matrix <- clustering_matrix[, -1]  # Remove feature column
+  clustering_matrix <- as.matrix(clustering_matrix)
+  
+  # Hierarchical clustering for both rows (features) and columns (tissues)
+  row_clust <- hclust(dist(clustering_matrix))
+  col_clust <- hclust(dist(t(clustering_matrix)))
+  
+  # Reorder based on clustering
+  feature_order <- rownames(clustering_matrix)[row_clust$order]
+  tissue_order <- colnames(clustering_matrix)[col_clust$order]
+  
+  # Apply clustering order to the plot data
+  feature_long$feature_label <- factor(sub("feature_", "", feature_long$feature), 
+                                      levels = sub("feature_", "", feature_order))
+  feature_long$tissue <- factor(feature_long$tissue, levels = tissue_order)
+  
+  p <- ggplot(feature_long, aes(x = tissue, y = feature_label)) +
+    geom_tile(aes(fill = count), color = "white", size = 0.1) +
+    scale_fill_gradientn(colors = color_palette, name = "Selection\nFrequency") +
+    labs(x = NULL, y = "Feature ID") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 65, hjust = 1, size = 12, face = "bold"),
+      axis.text.y = element_text(size = 12, face = "bold"),
+      panel.grid = element_blank()
+    )
+  
+  return(p)
+}
+
+# Updated Figure 4 generation with clustering
+rin_heatmap <- create_heatmap(rin_features, 
+                             colorRampPalette(c("white", "#66CDAA", "#006400"))(100)) +
+  ggtitle("A")
+
+auto_heatmap <- create_heatmap(auto_features,
+                              colorRampPalette(c("white", "#FC8D62", "#D94801"))(100)) +
+  ggtitle("B")
 ```
 
 #------------------------------------------------------------------------------
