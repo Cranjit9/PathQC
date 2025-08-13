@@ -1,0 +1,1041 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+#===============================================================================
+# Optimized Pan-Tissue Pipeline with ANOVA F-Score & GLMNET
+#===============================================================================
+# Install from source with specific options
+
+library(data.table)
+library(glmnet)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(doParallel)
+library(dplyr)
+library(reshape2)
+library(cowplot)
+library(magick)
+
+
+registerDoParallel(cores = detectCores() - 2)
+
+# Load data
+merged_gtex <- readRDS("data/processed/merged_gtex.rds")
+```
+
+#------------------------------------------------------------------------------
+# Data Preparation
+#------------------------------------------------------------------------------
+```{r}
+set.seed(123)
+get_tissue_sequence <- function(gtex_data) {
+  tissue_stats <- gtex_data[!is.na(SMRIN), .N, by = tissue_main][order(-N)]
+  return(tissue_stats$tissue_main)
+}
+
+tissue_sequence <- get_tissue_sequence(merged_gtex)
+n_tissues_to_test <- 29
+current_tissues <- tissue_sequence[1:n_tissues_to_test]
+
+# Prepare dataset
+tissue_data <- merged_gtex[tissue_main %in% current_tissues & !is.na(SMRIN) & !is.na(SMATSSCR)]
+tissue_data$tissue_class <- factor(tissue_data$tissue_main, levels = current_tissues)
+tissue_data$rin_quartile <- cut(tissue_data$SMRIN, 
+                               breaks = quantile(tissue_data$SMRIN, probs = 0:4/4),
+                               include.lowest = TRUE, labels = paste0("Q", 1:4))
+
+# Autolysis are categorical values(0,1,2,3)
+tissue_data$autolysis_quartile <- as.factor(paste0("A", tissue_data$SMATSSCR))
+tissue_data$strat_var <- paste(tissue_data$tissue_class, tissue_data$rin_quartile, sep = "_")
+
+# Feature preparation
+feature_cols <- grep("^feature_", names(tissue_data), value = TRUE)
+
+# Train-test split
+train_indices <- createDataPartition(tissue_data$strat_var, p = 0.7, list = FALSE)
+train_data <- tissue_data[train_indices]
+test_data <- tissue_data[-train_indices]
+```
+
+#-----------------------------------------------------------------------------------
+# Stage 1: ANOVA-based Feature Selection + Tissue Classification using GLMNET 
+#-----------------------------------------------------------------------------------
+```{r}
+# ANOVA F-test feature selection
+pb <- txtProgressBar(min = 0, max = length(feature_cols), style = 3)
+f_scores <- sapply(seq_along(feature_cols), function(i) {
+  f <- feature_cols[i]
+  anova_result <- aov(train_data[[f]] ~ train_data$tissue_class)
+  setTxtProgressBar(pb, i)
+  return(summary(anova_result)[[1]]$`F value`[1])
+})
+close(pb)
+
+names(f_scores) <- feature_cols
+top_100_features <- names(sort(f_scores, decreasing = TRUE, na.last = TRUE)[1:500])
+
+# Train tissue classifier
+train_tissue_classifier_optimized <- function(train_data, features) {
+  train_subset <- train_data[, c(features, "tissue_class"), with = FALSE]
+  X_train <- as.matrix(train_subset[, ..features])
+  y_train <- train_subset$tissue_class
+  
+  # Create stratified folds
+  set.seed(123)
+  stratified_folds <- createFolds(y_train, k = 5, list = TRUE, returnTrain = FALSE)
+  foldid <- rep(NA, length(y_train))
+  for(i in 1:length(stratified_folds)) {
+    foldid[stratified_folds[[i]]] <- i
+  }
+  
+  # Cross-validation with timing
+  start_time <- Sys.time()
+  model <- cv.glmnet(X_train, y_train, 
+                     family = "multinomial", 
+                     alpha = 1,
+                     foldid = foldid,
+                     standardize = TRUE,
+                     parallel = TRUE)
+  
+  print(paste("Training completed in", round(as.numeric(difftime(Sys.time(), start_time, units = "mins")), 1), "minutes"))
+  
+  return(list(
+    model = model,
+    features = features,
+    tissue_levels = levels(y_train)
+  ))
+}
+
+tissue_classifier <- train_tissue_classifier_optimized(train_data, top_100_features)
+```
+
+#------------------------------------------------------------------------------
+# Stage 2: Tissue-Specific RIN Models (Lasso)
+#------------------------------------------------------------------------------
+```{r}
+train_rin_models_lasso <- function(train_data, features, tissues) {
+  rin_models <- list()
+  performance_results <- data.frame()  # Store performance for sorting
+  
+  for(tissue in tissues) {
+    tissue_subset <- train_data[tissue_class == tissue]
+    if(nrow(tissue_subset) < 15) {
+      performance_results <- rbind(performance_results, 
+                                 data.frame(tissue = tissue, n = nrow(tissue_subset), 
+                                          r_val = NA, rmse = NA))
+      next
+    }
+    
+    # Use ALL features - let Lasso do the selection
+    selected_features <- features
+    X_tissue <- as.matrix(tissue_subset[, ..selected_features])
+    y_tissue <- tissue_subset$SMRIN
+    
+    # Stratified CV by RIN quartiles
+    set.seed(123)
+    rin_quartiles <- cut(y_tissue, breaks = quantile(y_tissue, probs = 0:4/4), include.lowest = TRUE)
+    folds <- createFolds(rin_quartiles, k = 5, returnTrain = FALSE)
+    foldid <- rep(NA, length(y_tissue))
+    for(i in seq_along(folds)) foldid[folds[[i]]] <- i
+    
+    # Built-in CV for RIN models - standardize=TRUE by default
+    set.seed(123)
+    cv_fit <- cv.glmnet(X_tissue, y_tissue, alpha = 1, foldid = foldid, parallel = TRUE)
+    model <- glmnet(X_tissue, y_tissue, alpha = 1, lambda = cv_fit$lambda.min)
+    
+    # Calculate performance on training data
+    pred <- predict(model, X_tissue, s = cv_fit$lambda.min)
+    r_val <- cor(pred, y_tissue)
+    rmse <- sqrt(mean((pred - y_tissue)^2))
+    
+    rin_models[[tissue]] <- list(
+      model = model,
+      lambda = cv_fit$lambda.min,
+      features = selected_features
+    )
+    
+    performance_results <- rbind(performance_results, 
+                               data.frame(tissue = tissue, n = nrow(tissue_subset), 
+                                        r_val = r_val, rmse = rmse))
+  }
+  
+  performance_results <- performance_results[order(-performance_results$r_val, na.last = TRUE), ]
+  
+  cat("Tissue-Specific RIN Performance:\n")
+  cat("================================\n")
+  
+  for(i in 1:nrow(performance_results)) {
+    row <- performance_results[i, ]
+    if(is.na(row$r_val)) {
+      cat(sprintf("%-20s: Insufficient samples (n=%d)\n", row$tissue, row$n))
+    } else {
+      cat(sprintf("%-20s: n=%3d, R=%.3f, RMSE=%.3f\n", row$tissue, row$n, row$r_val, row$rmse))
+    }
+  }
+  
+  return(list(models = rin_models, performance = performance_results))
+}
+
+rin_full_results <- train_rin_models_lasso(train_data, feature_cols, current_tissues)
+rin_models <- rin_full_results$models
+rin_training_performance <- rin_full_results$performance
+```
+
+#------------------------------------------------------------------------------
+# Stage 2.1: Tissue-Specific Autolysis Models (Lasso)
+#------------------------------------------------------------------------------
+```{r}
+train_autolysis_models_lasso <- function(train_data, features, tissues) {
+  autolysis_models <- list()
+  performance_results <- data.frame()
+  
+  for(tissue in tissues) {
+    tissue_subset <- train_data[tissue_class == tissue]
+    if(nrow(tissue_subset) < 15) {
+      performance_results <- rbind(performance_results, 
+                                 data.frame(tissue = tissue, n = nrow(tissue_subset), 
+                                          accuracy = NA, r_val = NA, rmse = NA))
+      next
+    }
+    
+    # Use ALL features - let Lasso do the selection
+    selected_features <- features
+    X_tissue <- as.matrix(tissue_subset[, ..selected_features])
+    y_tissue <- tissue_subset$SMATSSCR
+    
+# Stratified CV by autolysis categories
+    set.seed(123)
+    autolysis_cat <- factor(y_tissue, levels = 0:3)
+    if(length(unique(autolysis_cat)) > 1) {
+      folds <- createFolds(autolysis_cat, k = 5, returnTrain = FALSE)
+      foldid <- rep(NA, length(y_tissue))
+      for(i in seq_along(folds)) foldid[folds[[i]]] <- i
+      
+      set.seed(123)
+      cv_fit <- cv.glmnet(X_tissue, y_tissue, alpha = 1, foldid = foldid, parallel = TRUE)
+    } else {
+      set.seed(123)
+      cv_fit <- cv.glmnet(X_tissue, y_tissue, alpha = 1, nfolds = 5, parallel = TRUE)
+    }
+    
+    model <- glmnet(X_tissue, y_tissue, alpha = 1, lambda = cv_fit$lambda.min)
+    
+    # Calculate performance on training data with zero variance check
+    pred <- predict(model, X_tissue, s = cv_fit$lambda.min)
+    rmse <- sqrt(mean((pred - y_tissue)^2))
+    
+    # Handle zero variance cases
+    # Handle zero variance cases
+    if(var(pred) == 0 || var(y_tissue) == 0) {
+      r_val <- NA
+    } else {
+      r_val <- cor(pred, y_tissue)
+    }
+    
+    autolysis_models[[tissue]] <- list(
+      model = model,
+      lambda = cv_fit$lambda.min,
+      features = selected_features
+    )
+  # Store performance results
+    performance_results <- rbind(performance_results, 
+                               data.frame(tissue = tissue, n = nrow(tissue_subset), 
+                                        r_val = r_val, rmse = rmse))
+  }
+  
+  # Sort by R value (descending) and print
+  performance_results <- performance_results[order(-performance_results$r_val, na.last = TRUE), ]
+  
+  cat("Tissue-Specific Autolysis Performance:\n")
+  cat("======================================\n")
+  
+  for(i in 1:nrow(performance_results)) {
+    row <- performance_results[i, ]
+    if(is.na(row$r_val)) {
+      cat(sprintf("%-20s: Insufficient samples (n=%d)\n", row$tissue, row$n))
+    } else {
+      cat(sprintf("%-20s: n=%3d, R=%.3f, RMSE=%.3f\n", row$tissue, row$n, row$r_val, row$rmse))
+    }
+  }
+  
+  return(list(models = autolysis_models, performance = performance_results))
+}
+
+autolysis_full_results <- train_autolysis_models_lasso(train_data, feature_cols, current_tissues)
+autolysis_models <- autolysis_full_results$models
+autolysis_training_performance <- autolysis_full_results$performance
+```
+
+#------------------------------------------------------------------------------
+# Batch Prediction
+#------------------------------------------------------------------------------
+```{r}
+predict_batch_optimized <- function(test_data, tissue_classifier, rin_models, autolysis_models, confidence_threshold = 0.6) {
+  # Tissue classification - Fixed for glmnet
+  test_matrix <- as.matrix(test_data[, tissue_classifier$features, with = FALSE])
+  
+  # Get probabilities from glmnet (returns matrix)
+  all_probs <- predict(tissue_classifier$model, test_matrix, s = "lambda.min", type = "response")
+  if(length(dim(all_probs)) == 3) all_probs <- all_probs[,,1]  # Extract 2D matrix
+  
+  # Get predicted classes
+  predicted_tissues <- apply(all_probs, 1, function(x) tissue_classifier$tissue_levels[which.max(x)])
+  confidences <- apply(all_probs, 1, max)
+  
+  # RIN prediction
+  n_samples <- nrow(test_data)
+  rin_predictions <- rep(NA, n_samples)
+  used_for_rin <- rep(FALSE, n_samples)
+  
+  for(tissue in names(rin_models)) {
+    tissue_mask <- (predicted_tissues == tissue) & (confidences >= confidence_threshold)
+    if(any(tissue_mask)) {
+      tissue_indices <- which(tissue_mask)
+      tissue_samples <- test_data[tissue_indices]
+      rin_model <- rin_models[[tissue]]
+      
+      tissue_matrix <- as.matrix(tissue_samples[, rin_model$features, with = FALSE])
+      batch_rin_pred <- predict(rin_model$model, tissue_matrix, s = rin_model$lambda)
+      
+      rin_predictions[tissue_indices] <- as.numeric(batch_rin_pred)
+      used_for_rin[tissue_indices] <- TRUE
+    }
+  }
+  
+  # Autolysis prediction - Same logic as RIN
+  autolysis_predictions <- rep(NA, n_samples)
+  used_for_autolysis <- rep(FALSE, n_samples)
+  
+  for(tissue in names(autolysis_models)) {
+    tissue_mask <- (predicted_tissues == tissue) & (confidences >= confidence_threshold)
+    if(any(tissue_mask)) {
+      tissue_indices <- which(tissue_mask)
+      tissue_samples <- test_data[tissue_indices]
+      autolysis_model <- autolysis_models[[tissue]]
+      
+      tissue_matrix <- as.matrix(tissue_samples[, autolysis_model$features, with = FALSE])
+      batch_autolysis_pred <- predict(autolysis_model$model, tissue_matrix, s = autolysis_model$lambda)
+      
+      autolysis_predictions[tissue_indices] <- as.numeric(batch_autolysis_pred)
+      used_for_autolysis[tissue_indices] <- TRUE
+    }
+  }
+  
+  # Results
+  results <- data.table(
+    true_tissue = test_data$tissue_class,
+    true_rin = test_data$SMRIN,
+    true_autolysis = test_data$SMATSSCR,
+    predicted_tissue = factor(predicted_tissues, levels = tissue_classifier$tissue_levels),
+    confidence = confidences,
+    rin_prediction = rin_predictions,
+    autolysis_prediction = autolysis_predictions,
+    used_for_rin = used_for_rin,
+    used_for_autolysis = used_for_autolysis
+  )
+  
+  # Add probability columns
+  for(i in 1:ncol(all_probs)) {
+    tissue <- tissue_classifier$tissue_levels[i]
+    prob_col <- paste0("prob_", gsub("[^A-Za-z0-9]", "_", tissue))
+    results[[prob_col]] <- all_probs[, i]
+  }
+  
+  return(results)
+}
+
+test_results <- predict_batch_optimized(test_data, tissue_classifier, rin_models, autolysis_models)
+```
+
+#------------------------------------------------------------------------------
+# Test Performance Summary
+#------------------------------------------------------------------------------
+```{r}
+# Function to get test performance summary
+get_test_performance_summary <- function(test_results) {
+  # RIN test performance
+  rin_test_perf <- test_results[used_for_rin == TRUE & !is.na(rin_prediction), .(
+    test_r = cor(rin_prediction, true_rin),
+    test_rmse = sqrt(mean((rin_prediction - true_rin)^2)),
+    test_n = .N
+  ), by = predicted_tissue][order(-test_r)]
+  
+    cat("Test Performance - Top 5 RIN:\n")
+    print(head(rin_test_perf, 5))
+  
+  # Autolysis test performance  
+  auto_test_perf <- test_results[used_for_autolysis == TRUE & !is.na(autolysis_prediction), .(
+    test_r = cor(autolysis_prediction, true_autolysis),
+    test_rmse = sqrt(mean((autolysis_prediction - true_autolysis)^2)),
+    test_n = .N
+  ), by = predicted_tissue][order(-test_r)]
+  
+  cat("\nTest Performance - Top 5 Autolysis:\n") 
+  print(head(auto_test_perf, 5))
+  
+  return(list(rin = rin_test_perf, autolysis = auto_test_perf))
+}
+
+# Get test performance
+test_performance <- get_test_performance_summary(test_results)
+
+```
+
+#------------------------------------------------------------------------------
+# Performance Evaluation
+#------------------------------------------------------------------------------
+```{r}
+evaluate_performance <- function(test_results, tissues) {
+  cm <- confusionMatrix(test_results$predicted_tissue, test_results$true_tissue)
+  
+  # Calculate AUC for each tissue
+  auc_values <- numeric(length(tissues))
+  names(auc_values) <- tissues
+  
+  for(tissue in tissues) {
+    binary_labels <- as.numeric(test_results$true_tissue == tissue)
+    prob_col <- paste0("prob_", gsub("[^A-Za-z0-9]", "_", tissue))
+    if(prob_col %in% names(test_results) && length(unique(binary_labels)) > 1) {
+      roc_obj <- roc(binary_labels, test_results[[prob_col]], quiet = TRUE)
+      auc_values[tissue] <- as.numeric(auc(roc_obj))
+    }
+  }
+  
+  macro_auc <- mean(auc_values, na.rm = TRUE)
+  
+  # RIN metrics
+  rin_subset <- test_results[used_for_rin == TRUE & !is.na(rin_prediction)]
+  rin_r <- if(nrow(rin_subset) > 0) cor(rin_subset$rin_prediction, rin_subset$true_rin) else NA
+  rin_rmse <- if(nrow(rin_subset) > 0) sqrt(mean((rin_subset$rin_prediction - rin_subset$true_rin)^2)) else NA
+  rin_coverage <- nrow(rin_subset) / nrow(test_results)
+  
+  # Autolysis metrics - Classification approach with all categories
+  autolysis_subset <- test_results[used_for_autolysis == TRUE & !is.na(autolysis_prediction)]
+  if(nrow(autolysis_subset) > 0) {
+    # Use all possible categories (0,1,2,3)
+    all_categories <- 0:3
+    
+    # Round predictions to nearest integer and clamp to 0-3
+    autolysis_pred_rounded <- round(autolysis_subset$autolysis_prediction)
+    autolysis_pred_rounded <- pmax(0, pmin(3, autolysis_pred_rounded))
+    
+    # Classification accuracy
+    autolysis_accuracy <- mean(autolysis_pred_rounded == autolysis_subset$true_autolysis)
+    
+    # Correlation with continuous predictions
+    autolysis_r <- cor(autolysis_subset$autolysis_prediction, autolysis_subset$true_autolysis)
+    autolysis_rmse <- sqrt(mean((autolysis_subset$autolysis_prediction - autolysis_subset$true_autolysis)^2))
+    
+    # Confusion matrix with all categories (0,1,2,3)
+    autolysis_cm <- table(
+      Predicted = factor(autolysis_pred_rounded, levels = all_categories), 
+      Actual = factor(autolysis_subset$true_autolysis, levels = all_categories)
+    )
+    
+    
+  } else {
+    autolysis_accuracy <- NA
+    autolysis_r <- NA
+    autolysis_rmse <- NA
+    autolysis_cm <- NULL
+  }
+  autolysis_coverage <- nrow(autolysis_subset) / nrow(test_results)
+  
+  return(list(
+    accuracy = cm$overall["Accuracy"],
+    macro_f1 = mean(cm$byClass[, "F1"], na.rm = TRUE),
+    macro_auc = macro_auc,
+    auc_values = auc_values,
+    rin_r = rin_r,
+    rin_rmse = rin_rmse,
+    rin_coverage = rin_coverage,
+    autolysis_accuracy = autolysis_accuracy,
+    autolysis_r = autolysis_r,
+    autolysis_rmse = autolysis_rmse,
+    autolysis_coverage = autolysis_coverage,
+    autolysis_confusion_matrix = autolysis_cm,
+    confusion_matrix = cm$table
+  ))
+}
+
+performance <- evaluate_performance(test_results, current_tissues)
+```
+
+#------------------------------------------------------------------------------
+# Print overall Testing data performance summary
+#------------------------------------------------------------------------------
+```{r}
+# Print performance summary
+cat("=== PERFORMANCE SUMMARY ===\n")
+cat("Tissue Classification:\n")
+cat(sprintf("  Accuracy: %.3f\n", performance$accuracy))
+cat(sprintf("  Macro F1: %.3f\n", performance$macro_f1))
+cat(sprintf("  Macro AUC: %.3f\n", performance$macro_auc))
+cat("\nRIN Prediction:\n")
+cat(sprintf("  Correlation: %.3f\n", performance$rin_r))
+cat(sprintf("  RMSE: %.3f\n", performance$rin_rmse))
+cat(sprintf("  Coverage: %.3f\n", performance$rin_coverage))
+cat("\nAutolysis Prediction:\n")
+cat(sprintf("  Accuracy: %.3f\n", performance$autolysis_accuracy))
+cat(sprintf("  Correlation: %.3f\n", performance$autolysis_r))
+cat(sprintf("  RMSE: %.3f\n", performance$autolysis_rmse))
+cat(sprintf("  Coverage: %.3f\n", performance$autolysis_coverage))
+```
+
+
+
+#------------------------------------------------------------------------------
+# Quality Prediction Visualization (RIN + Autolysis)
+#------------------------------------------------------------------------------
+```{r}
+#------------------------------------------------------------------------------
+# Simplified Quality Prediction Visualization
+#------------------------------------------------------------------------------
+
+# Unified RIN plot function 
+create_rin_plot <- function(test_results, top_n = NULL, show_legend = FALSE) {
+  rin_subset <- test_results[used_for_rin == TRUE & !is.na(rin_prediction)]
+  if(nrow(rin_subset) == 0) return(NULL)
+  
+  # Filter to top N tissues if specified
+  if(!is.null(top_n)) {
+    tissue_performance <- rin_subset[, .(
+      correlation = cor(rin_prediction, true_rin),
+      n_samples = .N
+    ), by = predicted_tissue][order(-correlation)]
+    
+    top_tissues <- head(tissue_performance$predicted_tissue, top_n)
+    rin_subset <- rin_subset[predicted_tissue %in% top_tissues]
+    
+    # Add facet labels with R values
+    rin_subset <- merge(rin_subset, tissue_performance[, .(predicted_tissue, correlation)], by = "predicted_tissue")
+    rin_subset$facet_label <- paste0(rin_subset$predicted_tissue, "\n(R = ", round(rin_subset$correlation, 3), ")")
+    facet_layer <- facet_wrap(~facet_label, scales = "free")
+    title_suffix <- paste(" - Top", top_n, "Tissues")
+    coord_layer <- NULL  # No coord_fixed for faceted plots
+  } else {
+    overall_r <- cor(rin_subset$rin_prediction, rin_subset$true_rin)
+    facet_layer <- NULL
+    title_suffix <- paste0("\nOverall R = ", round(overall_r, 3), " (n = ", nrow(rin_subset), ")")
+    coord_layer <- coord_fixed()  # Only use coord_fixed for non-faceted plots
+  }
+  
+  p <- ggplot(rin_subset, aes(x = true_rin, y = rin_prediction)) +
+    geom_point(aes(color = predicted_tissue), alpha = 0.6, size = if(is.null(top_n)) 1 else 1.5) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_smooth(method = "lm", se = TRUE, color = "blue") +
+    scale_color_manual(values = tissue_colors, name = "Tissue") +
+    facet_layer +
+    coord_layer +
+    labs(x = "True RIN Score", y = "Predicted RIN Score",
+         title = paste0("RIN Prediction Performance", title_suffix)) +
+    theme_minimal() +
+    theme(legend.position = if(show_legend) "bottom" else "none")
+  
+  return(p)
+}
+
+# Unified Autolysis plot function - FIXED  
+create_autolysis_plot <- function(test_results, top_n = NULL, show_legend = FALSE) {
+  autolysis_subset <- test_results[used_for_autolysis == TRUE & !is.na(autolysis_prediction)]
+  if(nrow(autolysis_subset) == 0) return(NULL)
+  
+  # Filter to top N tissues if specified
+ 
+  if(!is.null(top_n)) {
+    tissue_performance <- autolysis_subset[, .(
+      correlation = {
+        if(var(autolysis_prediction) == 0 || var(true_autolysis) == 0) {
+          NA_real_
+        } else {
+          cor(autolysis_prediction, true_autolysis)
+        }
+      },
+      n_samples = .N
+    ), by = predicted_tissue][order(-correlation, na.last = TRUE)]
+    
+    top_tissues <- head(tissue_performance$predicted_tissue, top_n)
+    autolysis_subset <- autolysis_subset[predicted_tissue %in% top_tissues]
+    
+    # Add facet labels with R values  
+    autolysis_subset <- merge(autolysis_subset, tissue_performance[, .(predicted_tissue, correlation)], by = "predicted_tissue")
+    autolysis_subset$facet_label <- paste0(autolysis_subset$predicted_tissue, "\n(R = ", 
+                                          ifelse(is.na(autolysis_subset$correlation), "NA", 
+                                                round(autolysis_subset$correlation, 3)), ")")
+    
+    # CRITICAL FIX: Create ordered factor based on correlation rank
+    ordered_labels <- tissue_performance[predicted_tissue %in% top_tissues]$predicted_tissue
+    ordered_facet_labels <- paste0(ordered_labels, "\n(R = ", 
+                                  round(tissue_performance[predicted_tissue %in% top_tissues]$correlation, 3), ")")
+    
+    autolysis_subset$facet_label <- factor(autolysis_subset$facet_label, 
+                                          levels = ordered_facet_labels)
+    
+    facet_layer <- facet_wrap(~facet_label, scales = "free")
+    title_suffix <- paste(" - Top", top_n, "Tissues")
+    
+    # Use fill colors for top N
+    p <- ggplot(autolysis_subset, aes(x = factor(true_autolysis, levels = 0:3), y = autolysis_prediction)) +
+      geom_boxplot(outlier.shape = NA, fill = "lightgray", alpha = 0.7) +
+      geom_jitter(aes(color = predicted_tissue), width = 0.2, height = 0, alpha = 0.6, size = 1.2) +
+      scale_color_manual(values = tissue_colors, name = "Tissue") +
+      theme_minimal() +
+      theme(legend.position = if(show_legend) "bottom" else "none") 
+    
+  } else {
+    overall_r <- cor(autolysis_subset$autolysis_prediction, autolysis_subset$true_autolysis)
+    facet_layer <- NULL
+    title_suffix <- paste0("\nOverall R = ", round(overall_r, 3), " (n = ", nrow(autolysis_subset), ")")
+    
+    # Use tissue colors for all tissues
+    p <- ggplot(autolysis_subset, aes(x = factor(true_autolysis, levels = 0:3), y = autolysis_prediction)) +
+      geom_boxplot(alpha = 0.7, outlier.shape = NA, fill = "lightblue") +
+      geom_jitter(aes(color = predicted_tissue), width = 0.2, alpha = 0.4, size = 0.8) +
+      scale_color_manual(values = tissue_colors, name = "Tissue") +
+      theme_minimal() +
+      theme(legend.position = if(show_legend) "bottom" else "none")
+  }
+  
+  p <- p +
+    facet_layer +
+    labs(x = "True Autolysis Score", y = "Predicted Autolysis Score",
+         title = paste0("Autolysis Prediction Performance", title_suffix)) +
+    scale_x_discrete(drop = FALSE)
+  
+  return(p)
+}
+
+# Generate plots using the new unified functions
+rin_plot <- create_rin_plot(test_results, top_n = 3)
+autolysis_plot <- create_autolysis_plot(test_results, top_n = 3) 
+pan_rin_plot <- create_rin_plot(test_results, show_legend = FALSE)
+pan_autolysis_plot <- create_autolysis_plot(test_results, show_legend = FALSE)
+
+# Save plots
+if(!is.null(rin_plot)) {
+  print(rin_plot)
+  ggsave("output/figures/rin_top3_scatter.pdf", rin_plot, width = 12, height = 8, dpi = 300)
+}
+
+if(!is.null(autolysis_plot)) {
+  print(autolysis_plot)
+  ggsave("output/figures/autolysis_top3_boxplot.pdf", autolysis_plot, width = 12, height = 8, dpi = 300)
+}
+
+if(!is.null(pan_rin_plot)) {
+  print(pan_rin_plot)
+  ggsave("output/figures/pan_tissue_rin_scatter.pdf", pan_rin_plot, width = 10, height = 8, dpi = 300)
+}
+
+if(!is.null(pan_autolysis_plot)) {
+  print(pan_autolysis_plot)
+  ggsave("output/figures/pan_tissue_autolysis_boxplot.pdf", pan_autolysis_plot, width = 10, height = 8, dpi = 300)
+}
+
+#------------------------------------------------------------------------------
+# Tissue-wise performance summary 
+#------------------------------------------------------------------------------
+
+create_tissue_performance_summary <- function(test_results) {
+  # RIN performance by tissue
+  rin_performance <- test_results[used_for_rin == TRUE & !is.na(rin_prediction), .(
+    rin_r = cor(rin_prediction, true_rin),
+    rin_rmse = sqrt(mean((rin_prediction - true_rin)^2)),
+    rin_n = .N
+  ), by = predicted_tissue]
+  
+  # Autolysis performance by tissue
+  autolysis_performance <- test_results[used_for_autolysis == TRUE & !is.na(autolysis_prediction), .(
+    autolysis_r = cor(autolysis_prediction, true_autolysis),
+    autolysis_rmse = sqrt(mean((autolysis_prediction - true_autolysis)^2)),
+    autolysis_accuracy = {
+      pred_rounded <- pmax(0, pmin(3, round(autolysis_prediction)))
+      mean(pred_rounded == true_autolysis)
+    },
+    autolysis_n = .N
+  ), by = predicted_tissue]
+  
+  # Combine performance metrics
+  tissue_summary <- merge(rin_performance, autolysis_performance, 
+                         by = "predicted_tissue", all = TRUE)
+  
+  # Performance comparison plot
+  performance_comparison <- ggplot(tissue_summary, aes(x = reorder(predicted_tissue, rin_r))) +
+    geom_point(aes(y = rin_r, color = "RIN", size = rin_n), alpha = 0.7) +
+    geom_point(aes(y = autolysis_r, color = "Autolysis", size = autolysis_n), alpha = 0.7) +
+    coord_flip() +
+    labs(x = "Tissue", y = "Correlation (R)", 
+         title = "Tissue-Specific Performance Comparison",
+         color = "Prediction Type", size = "Sample Size") +
+    theme_minimal() +
+    scale_color_manual(values = c("RIN" = "blue", "Autolysis" = "orange"))
+  
+  return(list(summary_table = tissue_summary, plot = performance_comparison))
+}
+
+# Generate remaining visualizations
+tissue_performance <- create_tissue_performance_summary(test_results)
+
+print(tissue_performance$plot)
+ggsave("output/figures/tissue_performance_comparison.pdf", tissue_performance$plot, width = 12, height = 10, dpi = 300)
+
+# Print summary table
+cat("\nTissue Performance Summary:\n")
+print(tissue_performance$summary_table[order(-rin_r)])
+```
+
+
+
+
+#------------------------------------------------------------------------------
+# Pan-Tissue Figure for legends
+#------------------------------------------------------------------------------
+```{r}
+make_spread_legend <- function(tissue_colors, n_rows = 2, point_size = 4, text_size = 4) {
+  tissues <- names(tissue_colors)
+  n <- length(tissues)
+  
+  # Wrap names at space for multi-word tissues
+  tissue_labels <- str_replace_all(tissues, " ", "  \n")
+  
+  # Items per row
+  per_row <- ceiling(n / n_rows)
+  
+  # Evenly spaced columns across fixed width
+  total_width <- 100
+  col_positions <- rep(seq(5, total_width - 5, length.out = per_row), times = n_rows)[1:n]
+  row_labels <- rep(paste("Row", seq_len(n_rows)), each = per_row)[1:n]
+  
+  legend_data <- data.frame(
+    tissue = tissues,
+    label = tissue_labels,
+    col = col_positions,
+    row = factor(row_labels, levels = paste("Row", 1:n_rows))
+  )
+  
+  ggplot(legend_data, aes(x = col, y = row)) +
+    geom_point(aes(color = tissue), size = point_size) +
+    geom_text(aes(label = label), size = text_size, hjust = -0.2, vjust = 0.5, color = "black", lineheight = 0.9) +
+    scale_color_manual(values = tissue_colors, guide = "none") +
+    scale_x_continuous(limits = c(0, total_width), expand = c(0, 0)) +
+    scale_y_discrete(expand = expansion(mult = c(0.25, 0.25))) +  # more vertical space
+    theme_void() +
+    theme(
+      plot.margin = margin(5, 10, 5, 10),
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+    ) +
+    coord_cartesian(clip = "off") +
+    labs(title = "Tissue")
+}
+
+# Example usage
+manual_legend <- make_spread_legend(tissue_colors, n_rows = 2, point_size = 4, text_size = 4)
+
+plots_combined <- plot_grid(
+  create_rin_plot(test_results, show_legend = FALSE),
+  create_autolysis_plot(test_results, show_legend = FALSE),
+   labels = c("B", "C"), label_size = 16,
+  nrow = 1
+)
+
+final_with_manual_legend <- plot_grid(
+  plots_combined,
+  manual_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.3)
+)
+
+print(final_with_manual_legend)
+
+```
+
+
+```{r}
+#------------------------------------------------------------------------------
+# Pan-Tissue Figure
+#------------------------------------------------------------------------------
+
+# Load pan-tissue model diagram
+biorender_img <- magick::image_read("output/figures/pathqc Pan model.png", density = 600)[1]
+biorender_plot <- ggdraw() + draw_image(biorender_img)
+
+# Row 1: Panel A (Model diagram)
+first_row <- plot_grid(
+  biorender_plot,
+  labels = "A",
+  label_size = 16,
+  rel_heights = c(0.9),
+  ncol = 1
+)
+
+# Row 2: Panel B and C (RIN and Autolysis performance)
+second_row <- plot_grid(
+  final_with_manual_legend,
+  rel_widths = c(1, 1),
+  nrow = 1
+)
+
+# Combine all rows
+combined_plot_final <- plot_grid(
+  first_row,
+  second_row,
+  ncol = 1,
+  rel_heights = c(1, 1.2),
+  align = "v",
+  axis = "lr",
+  vjust = 0.5,
+  hjust = 0.5
+)
+
+# Save final figure
+ggsave("output/figures/PanTissue_Performance.pdf", combined_plot_final, width = 16, height = 10, dpi = 600)
+```
+
+#------------------------------------------------------------------------------
+# Tissue Classification Visualization (Confusion Matrix + AUC)
+#------------------------------------------------------------------------------t
+```{r}
+# 1. Tissue Classification Confusion Matrix
+create_confusion_plot <- function(confusion_matrix) {
+  cm_df <- as.data.frame(confusion_matrix)
+  names(cm_df) <- c("Actual", "Predicted", "Count")
+  
+  ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Count)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Count), color = "black", size = 3) +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+          axis.text.y = element_text(size = 10)) +
+    labs(title = "Tissue Classification Confusion Matrix", 
+         x = "True Tissue", y = "Predicted Tissue")
+}
+# Generate and save tissue classification plots
+confusion_plot <- create_confusion_plot(performance$confusion_matrix)
+print(confusion_plot)
+ggsave("output/figures/tissue_confusion_matrix.pdf", confusion_plot, width = 14, height = 12, dpi = 300)
+```
+
+```{r}
+# Pairwise AUC Matrix Implementation
+calculate_pairwise_auc <- function(test_results) {
+  tissues <- levels(test_results$true_tissue)
+  n_tissues <- length(tissues)
+  
+  # Initialize matrix
+  auc_matrix <- matrix(NA, nrow = n_tissues, ncol = n_tissues,
+                       dimnames = list(tissues, tissues))
+  
+  # Calculate AUC for each tissue pair
+  for(i in 1:n_tissues) {
+    tissue_pos <- tissues[i]
+    prob_col_pos <- paste0("prob_", gsub("[^A-Za-z0-9]", "_", tissue_pos))
+    
+    for(j in 1:n_tissues) {
+      if(i == j) next  # Skip diagonal
+      
+      tissue_neg <- tissues[j]
+      prob_col_neg <- paste0("prob_", gsub("[^A-Za-z0-9]", "_", tissue_neg))
+      
+      # Get data for this tissue pair
+      pair_data <- test_results[true_tissue %in% c(tissue_pos, tissue_neg)]
+      
+      if(nrow(pair_data) > 0) {
+        # Calculate relative probability
+        prob_pos <- pair_data[[prob_col_pos]]
+        prob_neg <- pair_data[[prob_col_neg]]
+        relative_prob <- prob_pos / (prob_pos + prob_neg)
+        
+        # Binary labels
+        binary_labels <- as.numeric(pair_data$true_tissue == tissue_pos)
+        
+        # Calculate AUC
+        if(length(unique(binary_labels)) > 1) {
+          roc_obj <- roc(binary_labels, relative_prob, quiet = TRUE)
+          auc_matrix[i, j] <- as.numeric(auc(roc_obj))
+        }
+      }
+    }
+  }
+  
+  return(auc_matrix)
+}
+
+# Calculate matrix
+auc_matrix <- calculate_pairwise_auc(test_results)
+
+# Print matrix for inspection
+cat("Pairwise AUC Matrix (29x29):\n")
+print(round(auc_matrix, 3))
+
+# Create heatmap
+auc_melted <- melt(auc_matrix, na.rm = FALSE)
+names(auc_melted) <- c("Target_Tissue", "Background_Tissue", "AUC")
+
+# Summary of AUC range for better color scaling
+auc_range <- range(auc_melted$AUC, na.rm = TRUE)
+cat("AUC Range:", round(auc_range, 4), "\n")
+
+pairwise_auc_plot <- ggplot(auc_melted, aes(x = Background_Tissue, y = Target_Tissue, fill = AUC)) +
+  geom_tile(color = "white", size = 0.1) +
+  # Optimized color scale for high AUC values (0.97-1.0 range)
+  scale_fill_gradient(low = "lightblue", high = "darkblue", 
+                      limits = c(0.99, 1.0), na.value = "grey90",
+                      breaks = c(0.99, 0.995, 1.0),
+                      labels = c("0.99", "0.995", "1.00")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.position = "right") +
+  labs(title = "Pairwise AUC Matrix (Tissue Classification)", 
+       x = "Background Tissue (Distinguished From)", 
+       y = "Target Tissue (To Detect)",
+       fill = "AUC") +
+  coord_fixed()
+
+print(pairwise_auc_plot)
+ggsave("output/figures/pairwise_auc_heatmap.pdf", pairwise_auc_plot, width = 12, height = 10, dpi = 300)
+```
+
+
+```{r}
+#------------------------------------------------------------------------------
+# Figure S12: Pan-Tissue Model Performance Analysis
+#------------------------------------------------------------------------------
+
+# Left side: 2x2 grid (A, B, D, E)
+left_grid <- plot_grid(
+  rin_plot,                    # Panel A: Top 3 RIN scatter plots
+  autolysis_plot,              # Panel B: Top 3 autolysis boxplots
+  confusion_plot,              # Panel D: Confusion matrix  
+  pairwise_auc_plot,          # Panel E: Pairwise AUC heatmap
+  labels = c("A", "B", "D", "E"),
+  label_size = 16,
+  nrow = 2,
+  ncol = 2,
+  rel_widths = c(1, 1),
+  rel_heights = c(1, 1)
+)
+
+# Right side: Panel C (full height)
+right_panel <- plot_grid(
+  tissue_performance$plot,     # Panel C: Cross-tissue performance comparison
+  labels = "C",
+  label_size = 16,
+  ncol = 1
+)
+
+# Combine left grid with right panel
+figure_s12_combined <- plot_grid(
+  left_grid,
+  right_panel,
+  nrow = 1,
+  ncol = 2,
+  rel_widths = c(2, 1),        # Left side twice as wide as right
+  align = "v"
+)
+
+# Save Figure S12
+ggsave("output/figures/Figure_S12_PanTissue_Analysis.pdf", 
+       figure_s12_combined, 
+       width = 20, height = 12, dpi = 600, bg = "white")
+
+print("Figure S12 created successfully!")
+print(figure_s12_combined)
+```
+```{r}
+#------------------------------------------------------------------------------
+# Automatic Complete Performance Table Generation
+#------------------------------------------------------------------------------
+create_complete_performance_table <- function(rin_train_perf, auto_train_perf, test_results) {
+  # Convert training performance to data.table if not already
+  rin_train_perf <- as.data.table(rin_train_perf)
+  auto_train_perf <- as.data.table(auto_train_perf)
+  
+  # Get test performance
+  rin_test_perf <- test_results[used_for_rin == TRUE & !is.na(rin_prediction), .(
+    test_rin_r = cor(rin_prediction, true_rin),
+    test_rin_rmse = sqrt(mean((rin_prediction - true_rin)^2)),
+    test_rin_n = .N
+  ), by = predicted_tissue]
+  
+  autolysis_test_perf <- test_results[used_for_autolysis == TRUE & !is.na(autolysis_prediction), .(
+    test_auto_r = cor(autolysis_prediction, true_autolysis),
+    test_auto_rmse = sqrt(mean((autolysis_prediction - true_autolysis)^2)),
+    test_auto_n = .N
+  ), by = predicted_tissue]
+  
+  # Prepare training data (using standard data.frame operations)
+  rin_train_clean <- data.table(
+    tissue = rin_train_perf$tissue,
+    train_rin_r = rin_train_perf$r_val,
+    train_rin_rmse = rin_train_perf$rmse,
+    train_rin_n = rin_train_perf$n
+  )
+  
+  auto_train_clean <- data.table(
+    tissue = auto_train_perf$tissue,
+    train_auto_r = auto_train_perf$r_val,
+    train_auto_rmse = auto_train_perf$rmse,
+    train_auto_n = auto_train_perf$n
+  )
+  
+  # Merge training performance
+  train_combined <- merge(rin_train_clean, auto_train_clean, by = "tissue", all = TRUE)
+  
+  # Merge with test performance
+  complete_table <- merge(train_combined, rin_test_perf, 
+                         by.x = "tissue", by.y = "predicted_tissue", all.x = TRUE)
+  complete_table <- merge(complete_table, autolysis_test_perf, 
+                         by.x = "tissue", by.y = "predicted_tissue", all.x = TRUE)
+  
+  # Clean and format
+  final_table <- complete_table[, .(
+    Tissue = tissue,
+    Train_RIN_R = round(train_rin_r, 3),
+    Test_RIN_R = round(test_rin_r, 3),
+    Train_Auto_R = round(train_auto_r, 3), 
+    Test_Auto_R = round(test_auto_r, 3),
+    Train_RIN_N = train_rin_n,
+    Test_RIN_N = test_rin_n,
+    Train_Auto_N = train_auto_n,
+    Test_Auto_N = test_auto_n,
+    Train_RIN_RMSE = round(train_rin_rmse, 3),
+    Test_RIN_RMSE = round(test_rin_rmse, 3),
+    Train_Auto_RMSE = round(train_auto_rmse, 3),
+    Test_Auto_RMSE = round(test_auto_rmse, 3)
+  )]
+  
+  # Order by training RIN performance (handle NA values)
+  final_table <- final_table[order(-Train_RIN_R, na.last = TRUE)]
+  
+  return(final_table)
+}
+
+# Generate the complete table
+complete_performance_table <- create_complete_performance_table(
+  rin_training_performance, 
+  autolysis_training_performance, 
+  test_results
+)
+
+# Save as CSV
+write.csv(complete_performance_table, 
+          "output/figures/Supplementary_Table_S1_Complete_Performance.csv", 
+          row.names = FALSE)
+
+# Print preview
+cat("Supplementary Table S1: Complete Training vs Test Performance\n")
+cat("==============================================================\n")
+print(complete_performance_table)
+
+cat("\nTable saved to: output/figures/Supplementary_Table_S1_Complete_Performance.csv\n")
+```
+
+
+
