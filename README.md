@@ -2,7 +2,7 @@
 
 ## Overview
 
-This pipeline analyzes GTEx (Genotype-Tissue Expression) whole-slide histological image features to predict tissue quality metrics. The primary goal is to build predictive models that can estimate RNA integrity (RIN scores) and tissue degradation levels (autolysis scores) from extracted image features across different human tissue types.
+This pipeline analyzes GTEx (Genotype-Tissue Expression) whole-slide histological image features to predict tissue quality metrics both **tissue-specific** and **pan-tissue modeling** approaches. The primary goal is to build predictive models that can estimate RNA integrity (RIN scores) and tissue degradation levels (autolysis scores) from extracted image features across different human tissue types.
 
 ## What We're Predicting
 
@@ -21,29 +21,42 @@ This pipeline analyzes GTEx (Genotype-Tissue Expression) whole-slide histologica
 ### Data Integration
 - Combines H5-formatted image features with GTEx metadata
 - Integrates quality metrics (RIN, autolysis) with demographic information
-- Processes 30+ tissue types with thousands of samples
+- Processes 29+ tissue types with 25 thousands of samples
 
 ### Analysis Pipeline
 1. **Feature Processing**: Standardization and quality filtering of image-derived features
 2. **Exploratory Analysis**: Tissue distribution, quality score patterns, demographic effects (Pipeline)
 3. **Dimensionality Reduction**: PCA and UMAP for tissue clustering visualization
-4. **Predictive Modeling**: Tissue-specific Lasso regression with cross-validation (lasso)
-5. **Model Evaluation**: Performance assessment, stability analysis, feature importance
 
-### Key Features
+### Two Methods Approaches
+
 - **Tissue-specific models**: Individual predictive models for each tissue type
 - **Feature selection**: Correlation-based selection of top 5% most predictive features
 - **Cross-validation**: 5-fold CV ensures robust performance estimates
 - **Comprehensive evaluation**: Multiple metrics (R, RMSE, MAE) and stability assessment
 
+### Pan-Tissue Pipeline
+- Data Preparation: Stratified train-test split with tissue and quality quartiles
+- Feature Selection: ANOVA F-score ranking for tissue discrimination (top 500 features)
+- Stage 1 - Tissue Classification:
+- Multi-class GLMNET with stratified cross-validation
+- Confidence-based predictions with threshold filtering
+
+### Stage 2 - Quality Prediction:
+- Tissue-specific Lasso models for RIN and autolysis prediction
+- Uses all available features with built-in Lasso selection
+
+**Batch Prediction**: Integrated workflow for tissue identification → quality prediction
+**Performance Evaluation**: Multi-metric assessment including accuracy, correlation, RMSE
+
 ## Quick Start
 
 ### Installation
 ```r
-# Core packages
 install.packages(c(
   "tidyverse", "data.table", "ggplot2", "readxl",
-  "umap", "glmnet", "caret", "corrplot"
+  "umap", "glmnet", "caret", "corrplot", "pROC",
+  "doParallel", "cowplot", "magick"
 ))
 
 # Bioconductor for HDF5 support
@@ -55,8 +68,7 @@ BiocManager::install("rhdf5")
 PathQC/
 ├── data/raw/
 │   ├── GTEX_AGGREGATED/concatnated_features_pooled.h5
-│   └── metadata/ (GTEx annotation files)
-├── src/ (analysis scripts)
+│   └── metadata/ (GTEx annotation files)(Publically available on GTEx website)
 └── output/ (generated figures and results)
 ```
 
